@@ -69,7 +69,7 @@ class OTPlanSampler:
         x0 : Tensor, shape (bs, *dim)
             represents the source minibatch
         x1 : Tensor, shape (bs, *dim)
-            represents the source minibatch
+            represents the target minibatch
 
         Returns
         -------
