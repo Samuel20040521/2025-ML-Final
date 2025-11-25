@@ -1,6 +1,5 @@
 import torch
 import argparse
-import csv
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
 from torchvision.utils import save_image
@@ -349,30 +348,13 @@ def plot_multi_batch_analysis(analysis, output_dir):
     plt.close()
     print(f"Saved analysis plot to {plot_path}")
     
-    # Save aggregated data to CSV
-    csv_path = os.path.join(output_dir, "analysis_data.csv")
-    with open(csv_path, 'w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(['eval_index', 'time', 'eval_type', 
-                        'cos_sim_mean', 'cos_sim_std',
-                        'angle_mean_deg', 'angle_std_deg',
-                        'vel_norm_mean', 'vel_norm_std'])
-        for i in range(len(cos_mean)):
-            writer.writerow([
-                i,
-                eval_times[i],
-                eval_types[i + 1],
-                cos_mean[i],
-                cos_std[i],
-                angle_per_step_mean[i],
-                angle_per_step_std[i],
-                vel_mean[i + 1],
-                vel_std[i + 1],
-            ])
-    print(f"Saved aggregated data to {csv_path}")
-    
     # Save summary to text file
     summary_path = os.path.join(output_dir, "summary.txt")
+    n = len(cos_mean)
+    early_angles = all_angles_tensor[:n//3].flatten()
+    mid_angles_phase = all_angles_tensor[n//3:2*n//3].flatten()
+    late_angles = all_angles_tensor[2*n//3:].flatten()
+    
     with open(summary_path, 'w') as f:
         f.write(f"=== Multi-Batch Velocity Field Analysis ===\n")
         f.write(f"Total batches: {num_batches}\n")
@@ -390,14 +372,9 @@ def plot_multi_batch_analysis(analysis, output_dir):
         f.write(f"  Std:  {all_angles.std():.2f}°\n")
         f.write(f"  Min: {all_angles.min():.2f}°\n")
         f.write(f"  Max: {all_angles.max():.2f}°\n")
-        
-        n = len(cos_mean)
-        early_angles = all_angles_tensor[:n//3].flatten()
-        mid_angles = all_angles_tensor[n//3:2*n//3].flatten()
-        late_angles = all_angles_tensor[2*n//3:].flatten()
         f.write(f"\nPhase-wise Angular Difference:\n")
         f.write(f"  Early (eval 0-{n//3}):    mean={early_angles.mean():.2f}°, std={early_angles.std():.2f}°\n")
-        f.write(f"  Mid   (eval {n//3}-{2*n//3}):  mean={mid_angles.mean():.2f}°, std={mid_angles.std():.2f}°\n")
+        f.write(f"  Mid   (eval {n//3}-{2*n//3}):  mean={mid_angles_phase.mean():.2f}°, std={mid_angles_phase.std():.2f}°\n")
         f.write(f"  Late  (eval {2*n//3}-{n}): mean={late_angles.mean():.2f}°, std={late_angles.std():.2f}°\n")
     
     print(f"Saved summary to {summary_path}")
