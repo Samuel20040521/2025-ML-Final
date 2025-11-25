@@ -6,6 +6,8 @@ import torch.nn.functional as F
 from torchvision.utils import save_image
 from models.model_configs import instantiate_model
 import numpy as np
+import os
+from pathlib import Path
 
 
 def load_checkpoint(model, checkpoint_path):
@@ -208,7 +210,7 @@ def run_multi_batch_analysis(
     return all_samples, aggregated_analysis
 
 
-def plot_multi_batch_analysis(analysis, output_prefix):
+def plot_multi_batch_analysis(analysis, output_dir):
     """Plot and save aggregated cosine similarity analysis from multiple batches."""
     
     eval_times = analysis["eval_times"][1:]  # Skip first (no previous velocity)
@@ -342,12 +344,13 @@ def plot_multi_batch_analysis(analysis, output_prefix):
     ax6.legend()
     
     plt.tight_layout()
-    plt.savefig(f"{output_prefix}_cosine_analysis.png", dpi=150)
+    plot_path = os.path.join(output_dir, "angular_analysis.png")
+    plt.savefig(plot_path, dpi=150)
     plt.close()
-    print(f"Saved analysis plot to {output_prefix}_cosine_analysis.png")
+    print(f"Saved analysis plot to {plot_path}")
     
-    # Save aggregated data to CSV (now including angular difference)
-    csv_path = f"{output_prefix}_cosine_data.csv"
+    # Save aggregated data to CSV
+    csv_path = os.path.join(output_dir, "analysis_data.csv")
     with open(csv_path, 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(['eval_index', 'time', 'eval_type', 
@@ -368,33 +371,40 @@ def plot_multi_batch_analysis(analysis, output_prefix):
             ])
     print(f"Saved aggregated data to {csv_path}")
     
-    # Print summary statistics
-    print(f"\n=== Multi-Batch Velocity Field Analysis ===")
-    print(f"Total batches: {num_batches}")
-    print(f"Batch size: {analysis['batch_size']}")
-    print(f"Total samples: {total_samples}")
-    print(f"ODE steps: {analysis['num_steps']}")
-    print(f"Total evaluations per sample: {analysis['num_evaluations']}")
-    print(f"\nCosine Similarity:")
-    print(f"  Mean: {all_cos_flat.mean():.4f}")
-    print(f"  Std:  {all_cos_flat.std():.4f}")
-    print(f"  Min:  {all_cos_flat.min():.4f}")
-    print(f"  Max:  {all_cos_flat.max():.4f}")
-    print(f"\nAngular Difference:")
-    print(f"  Mean: {all_angles.mean():.2f}°")
-    print(f"  Std:  {all_angles.std():.2f}°")
-    print(f"  Min: {all_angles.min():.2f}°")
-    print(f"  Max: {all_angles.max():.2f}°")
+    # Save summary to text file
+    summary_path = os.path.join(output_dir, "summary.txt")
+    with open(summary_path, 'w') as f:
+        f.write(f"=== Multi-Batch Velocity Field Analysis ===\n")
+        f.write(f"Total batches: {num_batches}\n")
+        f.write(f"Batch size: {analysis['batch_size']}\n")
+        f.write(f"Total samples: {total_samples}\n")
+        f.write(f"ODE steps: {analysis['num_steps']}\n")
+        f.write(f"Total evaluations per sample: {analysis['num_evaluations']}\n")
+        f.write(f"\nCosine Similarity:\n")
+        f.write(f"  Mean: {all_cos_flat.mean():.4f}\n")
+        f.write(f"  Std:  {all_cos_flat.std():.4f}\n")
+        f.write(f"  Min:  {all_cos_flat.min():.4f}\n")
+        f.write(f"  Max:  {all_cos_flat.max():.4f}\n")
+        f.write(f"\nAngular Difference:\n")
+        f.write(f"  Mean: {all_angles.mean():.2f}°\n")
+        f.write(f"  Std:  {all_angles.std():.2f}°\n")
+        f.write(f"  Min: {all_angles.min():.2f}°\n")
+        f.write(f"  Max: {all_angles.max():.2f}°\n")
+        
+        n = len(cos_mean)
+        early_angles = all_angles_tensor[:n//3].flatten()
+        mid_angles = all_angles_tensor[n//3:2*n//3].flatten()
+        late_angles = all_angles_tensor[2*n//3:].flatten()
+        f.write(f"\nPhase-wise Angular Difference:\n")
+        f.write(f"  Early (eval 0-{n//3}):    mean={early_angles.mean():.2f}°, std={early_angles.std():.2f}°\n")
+        f.write(f"  Mid   (eval {n//3}-{2*n//3}):  mean={mid_angles.mean():.2f}°, std={mid_angles.std():.2f}°\n")
+        f.write(f"  Late  (eval {2*n//3}-{n}): mean={late_angles.mean():.2f}°, std={late_angles.std():.2f}°\n")
     
-    # Phase analysis
-    n = len(cos_mean)
-    early_angles = all_angles_tensor[:n//3].flatten()
-    mid_angles = all_angles_tensor[n//3:2*n//3].flatten()
-    late_angles = all_angles_tensor[2*n//3:].flatten()
-    print(f"\nPhase-wise Angular Difference:")
-    print(f"  Early (eval 0-{n//3}):    mean={early_angles.mean():.2f}°, std={early_angles.std():.2f}°")
-    print(f"  Mid   (eval {n//3}-{2*n//3}):  mean={mid_angles.mean():.2f}°, std={mid_angles.std():.2f}°")
-    print(f"  Late  (eval {2*n//3}-{n}): mean={late_angles.mean():.2f}°, std={late_angles.std():.2f}°")
+    print(f"Saved summary to {summary_path}")
+    
+    # Print summary to console
+    with open(summary_path, 'r') as f:
+        print(f.read())
 
 
 def main():
@@ -402,13 +412,18 @@ def main():
     parser.add_argument("--checkpoint", required=True, help="Path to checkpoint")
     parser.add_argument("--total_samples", type=int, default=960, help="Total number of samples to generate")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size for each inference run")
-    parser.add_argument("--output", default="generated_samples.png")
+    parser.add_argument("--output", default="./inference_output", help="Output directory for all generated files")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--step_size", type=float, default=0.01)
     parser.add_argument("--save_all_samples", action="store_true", help="Save all generated samples (can be large)")
     args = parser.parse_args()
     
     device = torch.device(args.device)
+    
+    # Create output directory
+    output_dir = args.output
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    print(f"Output directory: {output_dir}")
     
     # Initialize model (same as training)
     model = instantiate_model(
@@ -434,19 +449,21 @@ def main():
     # Save sample grid (first 64 or fewer)
     num_preview = min(64, all_samples.shape[0])
     nrow = int(num_preview ** 0.5)
-    save_image(all_samples[:num_preview], args.output, nrow=nrow)
-    print(f"Saved {num_preview} sample preview to {args.output}")
+    preview_path = os.path.join(output_dir, "samples_preview.png")
+    save_image(all_samples[:num_preview], preview_path, nrow=nrow)
+    print(f"Saved {num_preview} sample preview to {preview_path}")
     
     # Optionally save all samples
     if args.save_all_samples:
-        all_samples_path = args.output.replace('.png', '_all.png')
+        all_samples_path = os.path.join(output_dir, "samples_all.png")
         nrow_all = int(all_samples.shape[0] ** 0.5)
         save_image(all_samples, all_samples_path, nrow=nrow_all)
         print(f"Saved all {all_samples.shape[0]} samples to {all_samples_path}")
     
     # Plot analysis
-    output_prefix = args.output.rsplit('.', 1)[0]
-    plot_multi_batch_analysis(analysis, output_prefix)
+    plot_multi_batch_analysis(analysis, output_dir)
+    
+    print(f"\n=== All outputs saved to: {output_dir} ===")
 
 
 if __name__ == "__main__":
