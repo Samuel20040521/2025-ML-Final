@@ -1,0 +1,23 @@
+=== Multi-Batch Velocity Field Analysis ===
+Total batches: 30
+Batch size: 32
+Total samples: 960
+ODE steps: 1
+Total evaluations per sample: 2
+
+Cosine Similarity:
+  Mean: 0.9930
+  Std:  0.0028
+  Min:  0.9784
+  Max:  0.9980
+
+Angular Difference:
+  Mean: 6.65°
+  Std:  1.30°
+  Min: 3.60°
+  Max: 11.93°
+
+Phase-wise Angular Difference:
+  Early (eval 0-0):    mean=nan°, std=nan°
+  Mid   (eval 0-0):  mean=nan°, std=nan°
+  Late  (eval 0-1): mean=6.65°, std=1.30°
