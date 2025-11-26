@@ -184,3 +184,12 @@ git branch -d feature/flow-matching-reproduce-deng
 3. **開發期間只 push 到自己的分支。**
 4. **要合併前，一定要先：`git pull origin main` → `git merge main` 到自己的分支，解決衝突再 push。**
 5. **用 Pull Request 把自己的分支合併回 `main`。**
+
+
+
+# run inference analysis
+```
+python analysis.py --output ./out_5   --checkpoint ./checkpoint-1799.pth     --total_samples 960     --batch_size 32       --step_size 0.2
+```
+output: output directory
+step_size: inference step(0.1 -> 10 steps)
