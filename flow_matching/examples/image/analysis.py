@@ -1,3 +1,4 @@
+import csv
 import torch
 import argparse
 import matplotlib.pyplot as plt
@@ -34,12 +35,31 @@ def model_forward(model, x, t, device):
     return result.to(dtype=torch.float32)
 
 
+def compute_angle_statistics(all_cos_sims):
+    """Return per-sample angles plus per-step mean/std (degrees)."""
+    clamped = torch.clamp(all_cos_sims, -1.0, 1.0)
+    all_angles = torch.rad2deg(torch.acos(clamped))
+    return (
+        all_angles,
+        all_angles.mean(dim=1),
+        all_angles.std(dim=1),
+    )
+
+
+def set_seed(seed):
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 def generate_samples_with_analysis(
     model,
     num_samples=16,
     image_size=32,
     device="cuda",
     step_size=0.01,
+    return_latent_trajectory=False,
+    return_final_latent=False,
 ):
     """Generate samples using midpoint method (matching original ODESolver behavior)."""
     model.eval()
@@ -55,10 +75,15 @@ def generate_samples_with_analysis(
     eval_times = []
     cosine_similarities = []
     cosine_similarities_per_sample = []
+    curvature_means = []
+    curvature_stds = []
+    curvatures_per_sample = []
     velocities_norm = []
     eval_types = []
-    
+
     prev_velocity = None
+    latent_trajectory = [] if return_latent_trajectory else None
+    final_latent = None
     eval_count = 0
     
     with torch.no_grad():
@@ -68,6 +93,10 @@ def generate_samples_with_analysis(
             dt = step_size
             t_mid = t + dt / 2
             
+            # Track latent at evaluation time (before velocity call)
+            if return_latent_trajectory:
+                latent_trajectory.append(x.detach().clone())
+
             # === First evaluation: velocity at (x, t) ===
             v1 = model_forward(model, x, t, device)
             
@@ -75,17 +104,25 @@ def generate_samples_with_analysis(
             vel_norm = v1.view(num_samples, -1).norm(dim=1).mean().item()
             velocities_norm.append(vel_norm)
             eval_types.append('start')
-            
+
             if prev_velocity is not None:
                 cos_per_sample, cos_mean = compute_cosine_similarity(prev_velocity, v1)
                 cosine_similarities.append(cos_mean)
                 cosine_similarities_per_sample.append(cos_per_sample.cpu())
-            
+
+                curvature_values = (v1 - prev_velocity).view(num_samples, -1).norm(dim=1)
+                curvature_means.append(curvature_values.mean().item())
+                curvature_stds.append(curvature_values.std().item())
+                curvatures_per_sample.append(curvature_values.cpu())
+
             prev_velocity = v1.clone()
             eval_count += 1
             
             # === Midpoint: x_mid = x + (dt/2) * v1 ===
             x_mid = x + (dt / 2) * v1
+
+            if return_latent_trajectory:
+                latent_trajectory.append(x_mid.detach().clone())
             
             # === Second evaluation: velocity at (x_mid, t_mid) ===
             v2 = model_forward(model, x_mid, t_mid, device)
@@ -98,12 +135,20 @@ def generate_samples_with_analysis(
             cos_per_sample, cos_mean = compute_cosine_similarity(prev_velocity, v2)
             cosine_similarities.append(cos_mean)
             cosine_similarities_per_sample.append(cos_per_sample.cpu())
-            
+
+            curvature_values = (v2 - prev_velocity).view(num_samples, -1).norm(dim=1)
+            curvature_means.append(curvature_values.mean().item())
+            curvature_stds.append(curvature_values.std().item())
+            curvatures_per_sample.append(curvature_values.cpu())
+
             prev_velocity = v2.clone()
             eval_count += 1
             
             # === Full step: x_next = x + dt * v2 ===
             x = x + dt * v2
+
+    if return_final_latent:
+        final_latent = x.detach().clone()
     
     print(f"Total evaluations recorded: {eval_count}")
     
@@ -117,11 +162,19 @@ def generate_samples_with_analysis(
         "eval_times": eval_times,
         "cosine_similarities": cosine_similarities,
         "cosine_similarities_per_sample": torch.stack(cosine_similarities_per_sample),
+        "curvature_means": curvature_means,
+        "curvature_stds": curvature_stds,
+        "curvatures_per_sample": torch.stack(curvatures_per_sample),
         "velocities_norm": velocities_norm,
         "eval_types": eval_types,
         "num_evaluations": eval_count,
     }
-    
+
+    if return_latent_trajectory:
+        analysis["latent_trajectory"] = torch.stack(latent_trajectory)
+    if return_final_latent:
+        analysis["final_latent"] = final_latent
+
     return samples, analysis
 
 
@@ -148,6 +201,8 @@ def run_multi_batch_analysis(
     all_batch_cos_sims = []
     # Shape: (num_batches, num_evals, batch_size) for per-sample cosine sim
     all_per_sample_cos_sims = []
+    # Curvature stats
+    all_per_sample_curvs = []
     # Velocity norms
     all_vel_norms = []
     
@@ -169,6 +224,7 @@ def run_multi_batch_analysis(
         all_samples.append(samples.cpu())
         all_batch_cos_sims.append(analysis["cosine_similarities"])
         all_per_sample_cos_sims.append(analysis["cosine_similarities_per_sample"])
+        all_per_sample_curvs.append(analysis["curvatures_per_sample"])
         all_vel_norms.append(analysis["velocities_norm"])
         
         # Store eval_times and eval_types from first batch (same for all)
@@ -181,12 +237,17 @@ def run_multi_batch_analysis(
     all_batch_cos_sims = torch.tensor(all_batch_cos_sims)
     # all_per_sample_cos_sims: (num_batches, num_evals, batch_size)
     all_per_sample_cos_sims = torch.stack(all_per_sample_cos_sims)
+    # Curvatures
+    all_per_sample_curvs = torch.stack(all_per_sample_curvs)
     # all_vel_norms: (num_batches, num_steps * 2)
     all_vel_norms = torch.tensor(all_vel_norms)
     
     # Concatenate all samples
     all_samples = torch.cat(all_samples, dim=0)
     
+    curvature_values = all_per_sample_curvs.permute(1, 0, 2).reshape(num_evals, -1)
+    all_cos_values = all_per_sample_cos_sims.permute(1, 0, 2).reshape(num_evals, -1)
+
     aggregated_analysis = {
         "eval_times": eval_times,
         "eval_types": eval_types,
@@ -194,7 +255,11 @@ def run_multi_batch_analysis(
         "cos_sim_per_step_mean": all_batch_cos_sims.mean(dim=0).tolist(),  # (num_evals,)
         "cos_sim_per_step_std": all_batch_cos_sims.std(dim=0).tolist(),    # (num_evals,)
         # All per-sample cosine similarities: (num_batches * batch_size, num_evals)
-        "all_per_sample_cos_sims": all_per_sample_cos_sims.permute(1, 0, 2).reshape(num_evals, -1),
+        "all_per_sample_cos_sims": all_cos_values,
+        # Curvature statistics
+        "curvature_per_step_mean": curvature_values.mean(dim=1).tolist(),
+        "curvature_per_step_std": curvature_values.std(dim=1).tolist(),
+        "all_curvature_values": curvature_values,
         # Velocity norms
         "vel_norm_per_step_mean": all_vel_norms.mean(dim=0).tolist(),
         "vel_norm_per_step_std": all_vel_norms.std(dim=0).tolist(),
@@ -204,9 +269,121 @@ def run_multi_batch_analysis(
         "total_samples": num_batches * batch_size,
         "num_steps": num_steps,
         "num_evaluations": num_steps * 2,
+        "image_size": image_size,
+        "step_size": step_size,
     }
     
     return all_samples, aggregated_analysis
+
+
+def run_reference_comparison(
+    model,
+    batch_size,
+    image_size,
+    device,
+    main_step_size,
+    ref_step_size,
+    max_batches,
+    ref_seed,
+):
+    """Run paired main/reference batches to estimate step-size sensitivity."""
+
+    final_errors = []
+    anchor_errors = None
+    anchor_eval_indices = None
+    anchor_times = None
+    ref_eval_times_cache = None
+
+    for batch_idx in range(max_batches):
+        seed = ref_seed + batch_idx
+        set_seed(seed)
+        _, analysis_main = generate_samples_with_analysis(
+            model,
+            num_samples=batch_size,
+            image_size=image_size,
+            device=device,
+            step_size=main_step_size,
+            return_latent_trajectory=True,
+            return_final_latent=True,
+        )
+
+        set_seed(seed)
+        _, analysis_ref = generate_samples_with_analysis(
+            model,
+            num_samples=batch_size,
+            image_size=image_size,
+            device=device,
+            step_size=ref_step_size,
+            return_latent_trajectory=True,
+            return_final_latent=True,
+        )
+
+        main_final = analysis_main.get("final_latent")
+        ref_final = analysis_ref.get("final_latent")
+        if main_final is None or ref_final is None:
+            continue
+
+        # Final-state trajectory deviation per sample
+        traj_err = (main_final - ref_final).view(batch_size, -1).norm(dim=1)
+        final_errors.append(traj_err.cpu())
+
+        # Per-anchor deviations along the trajectory
+        main_latents = analysis_main.get("latent_trajectory")
+        ref_latents = analysis_ref.get("latent_trajectory")
+        main_times = analysis_main.get("eval_times")
+        ref_times = analysis_ref.get("eval_times")
+
+        if main_latents is None or ref_latents is None or main_times is None or ref_times is None:
+            continue
+
+        if anchor_eval_indices is None:
+            anchors = list(range(0, len(main_times), 2))
+            if anchors[-1] != len(main_times) - 1:
+                anchors.append(len(main_times) - 1)
+            anchor_eval_indices = anchors
+            anchor_times = [main_times[k] for k in anchors]
+            anchor_errors = [[] for _ in anchors]
+            ref_eval_times_cache = ref_times
+
+        # Sanity: ensure anchor layout matches subsequent batches
+        if len(anchor_eval_indices) != len(anchor_times):
+            continue
+
+        for anchor_idx, k in enumerate(anchor_eval_indices):
+            t_main = main_times[k]
+            closest_ref_idx = min(range(len(ref_times)), key=lambda j: abs(ref_times[j] - t_main))
+            err = (main_latents[k] - ref_latents[closest_ref_idx]).view(batch_size, -1).norm(dim=1)
+            anchor_errors[anchor_idx].append(err.cpu())
+
+    summary = None
+    anchor_mean = None
+    anchor_std = None
+    if final_errors:
+        final_tensor = torch.cat(final_errors)
+        summary = {
+            "mean": final_tensor.mean().item(),
+            "std": final_tensor.std().item(),
+            "min": final_tensor.min().item(),
+            "max": final_tensor.max().item(),
+            "per_sample": final_tensor,
+        }
+
+    if anchor_errors is not None:
+        anchor_mean = []
+        anchor_std = []
+        for errs in anchor_errors:
+            concatenated = torch.cat(errs)
+            anchor_mean.append(concatenated.mean().item())
+            anchor_std.append(concatenated.std().item())
+
+    return {
+        "final_traj_error": summary,
+        "traj_err_per_anchor_mean": anchor_mean,
+        "traj_err_per_anchor_std": anchor_std,
+        "anchor_eval_indices": anchor_eval_indices,
+        "anchor_times": anchor_times,
+        "ref_eval_times": ref_eval_times_cache,
+    }
 
 
 def plot_multi_batch_analysis(analysis, output_dir):
@@ -217,22 +394,22 @@ def plot_multi_batch_analysis(analysis, output_dir):
     cos_std = analysis["cos_sim_per_step_std"]
     vel_mean = analysis["vel_norm_per_step_mean"]
     vel_std = analysis["vel_norm_per_step_std"]
-    all_cos_sims = analysis["all_per_sample_cos_sims"]  # (num_evals, total_samples)
+    curv_mean = analysis["curvature_per_step_mean"]
+    curv_std = analysis["curvature_per_step_std"]
+    all_cos_sims = analysis["all_per_sample_cos_sims"].cpu()  # (num_evals, total_samples)
+    all_curv_values = analysis["all_curvature_values"].cpu()
     eval_types = analysis["eval_types"]
     
     num_batches = analysis["num_batches"]
     total_samples = analysis["total_samples"]
     
     # === Convert ALL cosine similarities to angles (in degrees) ===
+    all_angles_tensor, angle_per_step_mean, angle_per_step_std = compute_angle_statistics(all_cos_sims)
+    all_angles = all_angles_tensor.flatten().numpy()
+    angle_per_step_mean_np = angle_per_step_mean.numpy()
+    angle_per_step_std_np = angle_per_step_std.numpy()
     all_cos_flat = all_cos_sims.flatten().numpy()
-    all_angles = np.degrees(np.arccos(np.clip(all_cos_flat, -1.0, 1.0)))
-    
-    # Per-step angle statistics
-    all_angles_tensor = torch.from_numpy(
-        np.degrees(np.arccos(np.clip(all_cos_sims.numpy(), -1.0, 1.0)))
-    )
-    angle_per_step_mean = all_angles_tensor.mean(dim=1).numpy()
-    angle_per_step_std = all_angles_tensor.std(dim=1).numpy()
+    all_curv_flat = all_curv_values.flatten().numpy()
     
     # Calculate y-axis range
     angle_min = all_angles.min()
@@ -240,18 +417,18 @@ def plot_multi_batch_analysis(analysis, output_dir):
     angle_margin = (angle_max - angle_min) * 0.05
     angle_ylim = (max(0, angle_min - angle_margin), angle_max + angle_margin)
     
-    # === Create figure with 3x2 subplots (ALL using angles) ===
-    fig, axes = plt.subplots(3, 2, figsize=(14, 15))
+    # === Create figure with 4x2 subplots (ALL using angles) ===
+    fig, axes = plt.subplots(4, 2, figsize=(14, 20))
     fig.suptitle(f"Velocity Field Analysis ({num_batches} batches, {total_samples} total samples)", fontsize=14)
     
     # Plot 1: Mean angular difference over evaluation index
     ax1 = axes[0, 0]
-    x_axis = range(len(angle_per_step_mean))
+    x_axis = range(len(angle_per_step_mean_np))
     ax1.fill_between(x_axis, 
-                     angle_per_step_mean - angle_per_step_std,
-                     angle_per_step_mean + angle_per_step_std,
+                     angle_per_step_mean_np - angle_per_step_std_np,
+                     angle_per_step_mean_np + angle_per_step_std_np,
                      alpha=0.3, color='blue')
-    ax1.plot(x_axis, angle_per_step_mean, 'b-', linewidth=1.5, label='Mean ± Std')
+    ax1.plot(x_axis, angle_per_step_mean_np, 'b-', linewidth=1.5, label='Mean ± Std')
     ax1.set_xlabel('Evaluation Index')
     ax1.set_ylabel('Angular Difference (degrees)')
     ax1.set_title(f'Mean Angular Difference Across {num_batches} Batches')
@@ -264,13 +441,13 @@ def plot_multi_batch_analysis(analysis, output_dir):
     start_indices = [i for i, t in enumerate(eval_types[1:]) if t == 'start']
     mid_indices = [i for i, t in enumerate(eval_types[1:]) if t == 'midpoint']
     
-    start_times = [eval_times[i] for i in start_indices if i < len(angle_per_step_mean)]
-    start_angles = [angle_per_step_mean[i] for i in start_indices if i < len(angle_per_step_mean)]
-    start_angle_std = [angle_per_step_std[i] for i in start_indices if i < len(angle_per_step_std)]
+    start_times = [eval_times[i] for i in start_indices if i < len(angle_per_step_mean_np)]
+    start_angles = [angle_per_step_mean_np[i] for i in start_indices if i < len(angle_per_step_mean_np)]
+    start_angle_std = [angle_per_step_std_np[i] for i in start_indices if i < len(angle_per_step_std_np)]
     
-    mid_times = [eval_times[i] for i in mid_indices if i < len(angle_per_step_mean)]
-    mid_angles = [angle_per_step_mean[i] for i in mid_indices if i < len(angle_per_step_mean)]
-    mid_angle_std = [angle_per_step_std[i] for i in mid_indices if i < len(angle_per_step_std)]
+    mid_times = [eval_times[i] for i in mid_indices if i < len(angle_per_step_mean_np)]
+    mid_angles = [angle_per_step_mean_np[i] for i in mid_indices if i < len(angle_per_step_mean_np)]
+    mid_angle_std = [angle_per_step_std_np[i] for i in mid_indices if i < len(angle_per_step_std_np)]
     
     ax2.errorbar(start_times, start_angles, yerr=start_angle_std, fmt='o', color='blue', 
                  markersize=3, alpha=0.6, label='Start eval', capsize=2)
@@ -286,10 +463,10 @@ def plot_multi_batch_analysis(analysis, output_dir):
     # Plot 3: Angular difference over evaluation index (green version)
     ax3 = axes[1, 0]
     ax3.fill_between(x_axis,
-                     angle_per_step_mean - angle_per_step_std,
-                     angle_per_step_mean + angle_per_step_std,
+                     angle_per_step_mean_np - angle_per_step_std_np,
+                     angle_per_step_mean_np + angle_per_step_std_np,
                      alpha=0.3, color='green')
-    ax3.plot(x_axis, angle_per_step_mean, 'g-', linewidth=1.5, label='Mean ± Std')
+    ax3.plot(x_axis, angle_per_step_mean_np, 'g-', linewidth=1.5, label='Mean ± Std')
     ax3.set_xlabel('Evaluation Index')
     ax3.set_ylabel('Angular Difference (degrees)')
     ax3.set_title('Angular Difference Between Consecutive Velocities')
@@ -342,7 +519,37 @@ def plot_multi_batch_analysis(analysis, output_dir):
     ax6.set_xlim(angle_ylim)
     ax6.legend()
     
-    plt.tight_layout()
+    # Plot 7: Local curvature per evaluation index
+    ax7 = axes[3, 0]
+    x_axis_curv = range(len(curv_mean))
+    curv_min = min([m - s for m, s in zip(curv_mean, curv_std)])
+    curv_max = max([m + s for m, s in zip(curv_mean, curv_std)])
+    curv_margin = (curv_max - curv_min) * 0.05
+    curv_ylim = (max(0, curv_min - curv_margin), curv_max + curv_margin)
+    ax7.fill_between(x_axis_curv,
+                     [m - s for m, s in zip(curv_mean, curv_std)],
+                     [m + s for m, s in zip(curv_mean, curv_std)],
+                     alpha=0.3, color='purple')
+    ax7.plot(x_axis_curv, curv_mean, 'm-', linewidth=1.5, label='Mean ± Std')
+    ax7.set_xlabel('Evaluation Index')
+    ax7.set_ylabel('L2 Difference Between Velocities')
+    ax7.set_title('Local Velocity Curvature per Evaluation Index')
+    ax7.grid(True, alpha=0.3)
+    ax7.set_ylim(curv_ylim)
+    ax7.legend()
+
+    # Plot 8: Histogram of curvature values
+    ax8 = axes[3, 1]
+    ax8.hist(all_curv_flat, bins=100, edgecolor='black', alpha=0.7, color='orange')
+    ax8.set_xlabel('Velocity Curvature (L2)')
+    ax8.set_ylabel('Frequency')
+    ax8.set_title(f'Distribution of Curvature Values\n'
+                  f'Mean: {all_curv_flat.mean():.4f}, Std: {all_curv_flat.std():.4f}')
+    ax8.axvline(x=all_curv_flat.mean(), color='r', linestyle='--', 
+                label=f'Mean={all_curv_flat.mean():.4f}')
+    ax8.legend()
+
+    plt.tight_layout(rect=(0, 0, 1, 0.97))
     plot_path = os.path.join(output_dir, "angular_analysis.png")
     plt.savefig(plot_path, dpi=150)
     plt.close()
@@ -354,6 +561,10 @@ def plot_multi_batch_analysis(analysis, output_dir):
     early_angles = all_angles_tensor[:n//3].flatten()
     mid_angles_phase = all_angles_tensor[n//3:2*n//3].flatten()
     late_angles = all_angles_tensor[2*n//3:].flatten()
+    curv_mean_global = all_curv_flat.mean()
+    curv_std_global = all_curv_flat.std()
+    curv_min = all_curv_flat.min()
+    curv_max = all_curv_flat.max()
     
     with open(summary_path, 'w') as f:
         f.write(f"=== Multi-Batch Velocity Field Analysis ===\n")
@@ -372,6 +583,24 @@ def plot_multi_batch_analysis(analysis, output_dir):
         f.write(f"  Std:  {all_angles.std():.2f}°\n")
         f.write(f"  Min: {all_angles.min():.2f}°\n")
         f.write(f"  Max: {all_angles.max():.2f}°\n")
+        f.write(f"\nCurvature (L2 difference between consecutive velocities):\n")
+        f.write(f"  Mean: {curv_mean_global:.4f}\n")
+        f.write(f"  Std:  {curv_std_global:.4f}\n")
+        f.write(f"  Min:  {curv_min:.4f}\n")
+        f.write(f"  Max:  {curv_max:.4f}\n")
+        reference = analysis.get("reference_comparison") if isinstance(analysis, dict) else None
+        if reference and reference.get("final_traj_error"):
+            final_err = reference["final_traj_error"]
+            f.write("\nTrajectory Deviation vs Reference:\n")
+            f.write(
+                f"  Final-state L2 error: mean={final_err['mean']:.4f}, std={final_err['std']:.4f}, "
+                f"min={final_err['min']:.4f}, max={final_err['max']:.4f}\n"
+            )
+            anchor_mean = reference.get("traj_err_per_anchor_mean")
+            if anchor_mean:
+                f.write(
+                    f"  Per-anchor mean L2 error (main vs ref) over {len(anchor_mean)} anchors\n"
+                )
         f.write(f"\nPhase-wise Angular Difference:\n")
         f.write(f"  Early (eval 0-{n//3}):    mean={early_angles.mean():.2f}°, std={early_angles.std():.2f}°\n")
         f.write(f"  Mid   (eval {n//3}-{2*n//3}):  mean={mid_angles_phase.mean():.2f}°, std={mid_angles_phase.std():.2f}°\n")
@@ -384,6 +613,85 @@ def plot_multi_batch_analysis(analysis, output_dir):
         print(f.read())
 
 
+def save_analysis_csv(analysis, output_dir):
+    """Save per-evaluation metrics to CSV, including curvature stats."""
+    eval_times = analysis["eval_times"][1:]
+    eval_types = analysis["eval_types"][1:]
+    cos_mean = analysis["cos_sim_per_step_mean"]
+    cos_std = analysis["cos_sim_per_step_std"]
+    vel_mean = analysis["vel_norm_per_step_mean"]
+    vel_std = analysis["vel_norm_per_step_std"]
+    curv_mean = analysis["curvature_per_step_mean"]
+    curv_std = analysis["curvature_per_step_std"]
+    _, angle_mean, angle_std = compute_angle_statistics(analysis["all_per_sample_cos_sims"].cpu())
+    angle_mean = angle_mean.numpy()
+    angle_std = angle_std.numpy()
+
+    reference = analysis.get("reference_comparison") if isinstance(analysis, dict) else None
+    anchor_lookup = {}
+    if reference:
+        anchors = reference.get("anchor_eval_indices") or []
+        anchor_mean = reference.get("traj_err_per_anchor_mean") or []
+        anchor_std = reference.get("traj_err_per_anchor_std") or []
+        for idx, mean_val, std_val in zip(anchors, anchor_mean, anchor_std):
+            anchor_lookup[idx] = (mean_val, std_val)
+
+    csv_path = os.path.join(output_dir, "analysis_data.csv")
+    fieldnames = [
+        "eval_index",
+        "time",
+        "eval_type",
+        "cos_sim_mean",
+        "cos_sim_std",
+        "angle_mean_deg",
+        "angle_std_deg",
+        "vel_norm_mean",
+        "vel_norm_std",
+        "curv_mean_k",
+        "curv_std_k",
+    ]
+
+    if anchor_lookup:
+        fieldnames.extend(["traj_err_mean_k", "traj_err_std_k"])
+
+    with open(csv_path, "w", newline="") as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        for idx in range(len(cos_mean)):
+            row = {
+                "eval_index": idx,
+                "time": eval_times[idx] if idx < len(eval_times) else None,
+                "eval_type": eval_types[idx] if idx < len(eval_types) else None,
+                "cos_sim_mean": cos_mean[idx],
+                "cos_sim_std": cos_std[idx],
+                "angle_mean_deg": angle_mean[idx] if idx < len(angle_mean) else None,
+                "angle_std_deg": angle_std[idx] if idx < len(angle_std) else None,
+                "vel_norm_mean": vel_mean[idx + 1] if idx + 1 < len(vel_mean) else None,
+                "vel_norm_std": vel_std[idx + 1] if idx + 1 < len(vel_std) else None,
+                "curv_mean_k": curv_mean[idx] if idx < len(curv_mean) else None,
+                "curv_std_k": curv_std[idx] if idx < len(curv_std) else None,
+            }
+
+            if anchor_lookup:
+                row["traj_err_mean_k"] = anchor_lookup.get(idx, (None, None))[0]
+                row["traj_err_std_k"] = anchor_lookup.get(idx, (None, None))[1]
+
+            writer.writerow(row)
+
+    print(f"Saved per-step metrics to {csv_path}")
+
+
+def maybe_save_curvature_tensor(curvature_tensor, output_dir, threshold=1_000_000):
+    """Persist full curvature tensor if it is large."""
+    if curvature_tensor.numel() < threshold:
+        return None
+
+    path = os.path.join(output_dir, "curvature_values.pt")
+    torch.save(curvature_tensor.cpu(), path)
+    print(f"Saved full curvature tensor to {path}")
+    return path
+
+
 def main():
     parser = argparse.ArgumentParser("CIFAR-10 Flow Matching Inference with Multi-Batch Cosine Similarity Analysis")
     parser.add_argument("--checkpoint", required=True, help="Path to checkpoint")
@@ -393,6 +701,9 @@ def main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--step_size", type=float, default=0.01)
     parser.add_argument("--save_all_samples", action="store_true", help="Save all generated samples (can be large)")
+    parser.add_argument("--ref_step_size", type=float, default=None, help="Optional smaller step size for reference trajectory")
+    parser.add_argument("--ref_max_batches", type=int, default=1, help="Number of batches to compare with reference trajectory")
+    parser.add_argument("--ref_seed", type=int, default=12345, help="Seed for aligning main and reference trajectories")
     args = parser.parse_args()
     
     device = torch.device(args.device)
@@ -422,6 +733,23 @@ def main():
         device=device,
         step_size=args.step_size,
     )
+
+    # Optional reference trajectory comparison
+    num_batches_main = (args.total_samples + args.batch_size - 1) // args.batch_size
+    if args.ref_step_size is not None:
+        ref_batches = min(args.ref_max_batches, num_batches_main)
+        print(f"Running reference comparison on {ref_batches} batch(es) with step_size={args.ref_step_size} and seed base {args.ref_seed}")
+        reference_comparison = run_reference_comparison(
+            model,
+            batch_size=args.batch_size,
+            image_size=analysis.get("image_size", 32) if isinstance(analysis, dict) else 32,
+            device=device,
+            main_step_size=args.step_size,
+            ref_step_size=args.ref_step_size,
+            max_batches=ref_batches,
+            ref_seed=args.ref_seed,
+        )
+        analysis["reference_comparison"] = reference_comparison
     
     # Save sample grid (first 64 or fewer)
     num_preview = min(64, all_samples.shape[0])
@@ -436,6 +764,10 @@ def main():
         nrow_all = int(all_samples.shape[0] ** 0.5)
         save_image(all_samples, all_samples_path, nrow=nrow_all)
         print(f"Saved all {all_samples.shape[0]} samples to {all_samples_path}")
+
+    # Save tabular metrics and optionally the full curvature tensor
+    save_analysis_csv(analysis, output_dir)
+    maybe_save_curvature_tensor(analysis["all_curvature_values"], output_dir)
     
     # Plot analysis
     plot_multi_batch_analysis(analysis, output_dir)

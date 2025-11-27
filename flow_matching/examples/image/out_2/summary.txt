@@ -6,18 +6,24 @@ ODE steps: 2
 Total evaluations per sample: 4
 
 Cosine Similarity:
-  Mean: 0.9887
-  Std:  0.0071
-  Min:  0.9486
-  Max:  0.9996
+  Mean: 0.9885
+  Std:  0.0072
+  Min:  0.9403
+  Max:  0.9991
 
 Angular Difference:
-  Mean: 8.27°
-  Std:  2.50°
-  Min: 1.59°
-  Max: 18.45°
+  Mean: 8.32°
+  Std:  2.49°
+  Min: 2.41°
+  Max: 19.89°
+
+Curvature (L2 difference between consecutive velocities):
+  Mean: 8.0518
+  Std:  2.4161
+  Min:  2.3264
+  Max:  18.9498
 
 Phase-wise Angular Difference:
-  Early (eval 0-1):    mean=9.34°, std=2.51°
-  Mid   (eval 1-2):  mean=8.84°, std=2.57°
-  Late  (eval 2-3): mean=6.63°, std=1.30°
+  Early (eval 0-1):    mean=9.44°, std=2.57°
+  Mid   (eval 1-2):  mean=8.85°, std=2.49°
+  Late  (eval 2-3): mean=6.69°, std=1.26°

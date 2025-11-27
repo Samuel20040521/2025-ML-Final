@@ -1,2 +1,2 @@
-eval_index,time,eval_type,cos_sim_mean,cos_sim_std,angle_mean_deg,angle_std_deg,vel_norm_mean,vel_norm_std
-0,0.5,midpoint,0.9930068254470825,0.0005835811607539654,6.654975,1.299668,54.63212203979492,0.13506968319416046
+eval_index,time,eval_type,cos_sim_mean,cos_sim_std,angle_mean_deg,angle_std_deg,vel_norm_mean,vel_norm_std,curv_mean_k,curv_std_k
+0,0.5,midpoint,0.9929421544075012,0.00053873733850196,6.6668544,1.3997365,54.62906265258789,0.10293097048997879,6.515963077545166,1.3506922721862793
