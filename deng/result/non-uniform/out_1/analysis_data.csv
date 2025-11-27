@@ -1,2 +1,0 @@
-eval_index,time,eval_type,cos_sim_mean,cos_sim_std,angle_mean_deg,angle_std_deg,vel_norm_mean,vel_norm_std,curv_mean_k,curv_std_k
-0,0.5,midpoint,1.6308699521600835e-14,5.844105143070025e-17,90.0,0.0,46.98395919799805,0.1452375054359436,46.98396301269531,0.7438576817512512
