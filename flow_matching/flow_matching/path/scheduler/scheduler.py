@@ -197,3 +197,37 @@ class CosineScheduler(Scheduler):
 
     def snr_inverse(self, snr: Tensor) -> Tensor:
         return 2.0 * torch.atan(snr) / torch.pi
+
+
+class PowerLawScheduler(Scheduler):
+    """Time-warped scheduler that applies a power-law reparameterization on top of a base scheduler."""
+
+    def __init__(self, base_scheduler: Scheduler, gamma: float = 3.0) -> None:
+        super().__init__()
+        assert gamma > 0.0, f"`gamma` must be positive, got {gamma}."
+        self.base_scheduler = base_scheduler
+        self.gamma = float(gamma)
+
+    def __call__(self, t: Tensor) -> SchedulerOutput:
+        # Reparameterized time tau = t^gamma
+        tau = t.pow(self.gamma)
+        base_out = self.base_scheduler(tau)
+
+        # Chain rule for derivatives: d/dt alpha(tau(t)) = d_alpha/d_tau * d_tau/dt
+        d_tau_dt = self.gamma * t.clamp(min=1e-12).pow(self.gamma - 1.0)
+        alpha_t = base_out.alpha_t
+        sigma_t = base_out.sigma_t
+        d_alpha_t = base_out.d_alpha_t * d_tau_dt
+        d_sigma_t = base_out.d_sigma_t * d_tau_dt
+
+        return SchedulerOutput(
+            alpha_t=alpha_t,
+            sigma_t=sigma_t,
+            d_alpha_t=d_alpha_t,
+            d_sigma_t=d_sigma_t,
+        )
+
+    def snr_inverse(self, snr: Tensor) -> Tensor:
+        # Find tau such that base scheduler gives the desired SNR, then invert tau = t^gamma
+        tau = self.base_scheduler.snr_inverse(snr)
+        return tau.clamp(min=0.0, max=1.0).pow(1.0 / self.gamma)

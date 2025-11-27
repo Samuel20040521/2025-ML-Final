@@ -1,0 +1,100 @@
+================================================================================
+COMPARISON REPORT: Baseline (Uniform) vs Non-Uniform (Power-Law Time Warp)
+================================================================================
+
+## Overview
+
+Baseline: Uniform time grid with midpoint ODE solver
+Non-Uniform: Power-law time warp (gamma=3.0) with midpoint ODE solver
+  - Time reparameterization: tau = t^3
+  - Effect: Concentrates more steps near t=0 (front-dense)
+
+================================================================================
+## Summary Comparison Table
+================================================================================
+
+Steps    | Method       | Angle Mean   | Angle Std    | Curv Mean    | Curv Std     | Early Angle 
+------------------------------------------------------------------------------------------
+1        | Baseline     |       6.67° |       1.40° |     6.5160 |     1.3500 |        nan°
+         | Non-Uniform  |      90.00° |       0.00° |    46.9840 |     0.7435 |      90.00°
+         | Delta        |     +83.33° |              |   +40.4680 |              |       +nan°
+------------------------------------------------------------------------------------------
+2        | Baseline     |       8.32° |       2.49° |     8.0518 |     2.4161 |       9.44°
+         | Non-Uniform  |      37.28° |      37.37° |    35.6671 |    21.6906 |      90.00°
+         | Delta        |     +28.96° |              |   +27.6153 |              |     +80.56°
+------------------------------------------------------------------------------------------
+5        | Baseline     |       5.61° |       3.14° |     5.6339 |     3.1065 |       8.03°
+         | Non-Uniform  |      14.35° |      26.85° |    16.8613 |    10.6594 |      31.65°
+         | Delta        |      +8.74° |              |   +11.2274 |              |     +23.62°
+------------------------------------------------------------------------------------------
+10       | Baseline     |       3.28° |       2.40° |     3.3366 |     2.3900 |       4.75°
+         | Non-Uniform  |       7.36° |      19.55° |     9.1892 |     5.9959 |      15.86°
+         | Delta        |      +4.08° |              |    +5.8526 |              |     +11.11°
+------------------------------------------------------------------------------------------
+20       | Baseline     |       1.89° |       1.75° |     1.9245 |     1.7040 |       2.41°
+         | Non-Uniform  |       3.82° |      14.04° |     5.0242 |     3.7691 |       7.45°
+         | Delta        |      +1.93° |              |    +3.0997 |              |      +5.04°
+------------------------------------------------------------------------------------------
+50       | Baseline     |       0.89° |       1.30° |     0.8878 |     1.1938 |       0.95°
+         | Non-Uniform  |       1.63° |       8.98° |     2.3102 |     2.7334 |       2.95°
+         | Delta        |      +0.74° |              |    +1.4224 |              |      +2.00°
+------------------------------------------------------------------------------------------
+
+================================================================================
+## Detailed Analysis
+================================================================================
+
+### Key Observations:
+
+1. **Angular Difference (Overall)**:
+   - Non-uniform (power-law) schedule shows HIGHER mean angular difference
+   - This indicates larger velocity changes between consecutive evaluations
+   - This is expected because power-law concentrates steps near t=0 where
+     the velocity field changes rapidly from noise to signal
+
+2. **Early Phase Angular Difference**:
+   - Non-uniform shows SIGNIFICANTLY higher early angles (up to 4x baseline)
+   - At t=0, the first evaluation shows ~90° difference (perpendicular velocities)
+   - This is because:
+     a) t^gamma (gamma=3) compresses early time steps extremely near t=0
+     b) At t≈0, the flow field transitions from pure noise to data-directed flow
+     c) The time warp applies different scaling to the velocity via chain rule
+
+3. **Mid/Late Phase Angular Difference**:
+   - Both methods show similar performance in mid/late phases
+   - Non-uniform is slightly better (lower angles) in these regions
+   - This suggests the time warp successfully allocates fewer steps
+     where the velocity field is smoother
+
+4. **Curvature (L2 Velocity Difference)**:
+   - Non-uniform shows 2-3x higher curvature values
+   - This correlates with the higher angular differences
+   - The velocity magnitude also increases significantly with time warp
+
+### Interpretation:
+
+The power-law time warp (gamma=3) applies a reparameterization tau = t^gamma.
+This means:
+- A uniform grid in t becomes a front-dense grid in tau (physical time)
+- The velocity is scaled: v_new(x, t) = (d_tau/dt) * v_old(x, tau)
+- d_tau/dt = gamma * t^(gamma-1), which is small near t=0 and large near t=1
+
+The **higher angular differences in early evaluations** suggest that:
+1. The time warp is correctly concentrating samples in the high-curvature region
+2. However, the velocity scaling amplifies the apparent curvature
+3. The comparison may not be directly fair without normalizing for the schedule
+
+### Recommendations for Phase 1:
+
+1. **Separate time grid from velocity scaling**: The current implementation
+   uses ScheduleTransformedModel which modifies both the time grid AND
+   the velocity. For a fair comparison, consider:
+   a) Using a non-uniform time grid without velocity transformation
+   b) Implementing front_dense_schedule() as planned in Plan.md
+
+2. **FID evaluation**: Add image quality metrics to measure actual
+   sample quality, not just velocity smoothness
+
+3. **Curvature-based schedule**: Use the baseline curvature data to
+   design an adaptive time grid that places steps where curvature is high
+

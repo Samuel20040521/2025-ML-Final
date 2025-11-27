@@ -14,7 +14,12 @@ import PIL.Image
 
 import torch
 from flow_matching.path import MixtureDiscreteProbPath
-from flow_matching.path.scheduler import PolynomialConvexScheduler
+from flow_matching.path.scheduler import (
+    CondOTScheduler,
+    PolynomialConvexScheduler,
+    PowerLawScheduler,
+    ScheduleTransformedModel,
+)
 from flow_matching.solver import MixtureDiscreteEulerSolver
 from flow_matching.solver.ode_solver import ODESolver
 from flow_matching.utils import ModelWrapper
@@ -89,6 +94,18 @@ def eval_model(
     cfg_scaled_model = CFGScaledModel(model=model)
     cfg_scaled_model.train(False)
 
+    velocity_model_for_sampling = cfg_scaled_model
+    if (not args.discrete_flow_matching) and getattr(args, "time_warp_enable", False):
+        gamma = args.time_warp_power if args.time_warp_power is not None else 3.0
+        original_scheduler = CondOTScheduler()
+        new_scheduler = PowerLawScheduler(base_scheduler=original_scheduler, gamma=gamma)
+        velocity_model_for_sampling = ScheduleTransformedModel(
+            velocity_model=cfg_scaled_model,
+            original_scheduler=original_scheduler,
+            new_scheduler=new_scheduler,
+        )
+        logger.info(f"Using power-law time warp with gamma={gamma} for inference")
+
     if args.discrete_flow_matching:
         scheduler = PolynomialConvexScheduler(n=3.0)
         path = MixtureDiscreteProbPath(scheduler=scheduler)
@@ -101,7 +118,7 @@ def eval_model(
             source_distribution_p=p,
         )
     else:
-        solver = ODESolver(velocity_model=cfg_scaled_model)
+        solver = ODESolver(velocity_model=velocity_model_for_sampling)
         ode_opts = args.ode_options
 
     fid_metric = FrechetInceptionDistance(normalize=True).to(

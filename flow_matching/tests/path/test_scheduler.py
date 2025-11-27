@@ -12,6 +12,7 @@ from flow_matching.path.scheduler import (
     CosineScheduler,
     LinearVPScheduler,
     PolynomialConvexScheduler,
+    PowerLawScheduler,
     SchedulerOutput,
     VPScheduler,
 )
@@ -86,6 +87,19 @@ class TestScheduler(unittest.TestCase):
         self.assert_output_shapes(outputs, self.t.shape)
 
         self.assert_recover_t_from_kappa(scheduler, self.t)
+        self.assert_recover_t_from_snr(scheduler, self.t)
+
+    def test_power_law_scheduler(self):
+        base = CosineScheduler()
+        scheduler = PowerLawScheduler(base_scheduler=base, gamma=3.0)
+        outputs = scheduler(self.t)
+        self.assert_output_shapes(outputs, self.t.shape)
+
+        # alpha and sigma should stay within [0,1] for cosine base on [0,1]
+        self.assertTrue(torch.all(outputs.alpha_t >= 0) and torch.all(outputs.alpha_t <= 1))
+        self.assertTrue(torch.all(outputs.sigma_t >= 0) and torch.all(outputs.sigma_t <= 1))
+
+        # SNR inversion should recover the original t
         self.assert_recover_t_from_snr(scheduler, self.t)
 
 

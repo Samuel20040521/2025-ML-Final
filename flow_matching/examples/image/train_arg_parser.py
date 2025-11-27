@@ -103,6 +103,37 @@ def get_args_parser():
         help="ODE solver options. Eg. the midpoint solver requires step-size, dopri5 has no options to set.",
     )
     parser.add_argument(
+        "--time_warp_enable",
+        action="store_true",
+        help="[LEGACY] Enable power-law time warp during inference with velocity scaling (uses ScheduleTransformedModel).",
+    )
+    parser.add_argument(
+        "--time_warp_power",
+        type=float,
+        default=None,
+        help="[LEGACY] Gamma exponent for power-law time warp; defaults to 3.0 when enabled.",
+    )
+    # Phase 1: Pure time-grid schedules (NO velocity scaling)
+    parser.add_argument(
+        "--num_steps",
+        type=int,
+        default=None,
+        help="Number of ODE steps for pure time-grid discretization. Use with --time_schedule.",
+    )
+    parser.add_argument(
+        "--time_schedule",
+        type=str,
+        default=None,
+        choices=["uniform", "front_dense", "back_dense", "cosine", "sigmoid", "quadratic"],
+        help="Time schedule type for pure discretization (no velocity scaling). Requires --num_steps.",
+    )
+    parser.add_argument(
+        "--schedule_gamma",
+        type=float,
+        default=3.0,
+        help="Gamma exponent for front_dense/back_dense schedules (default: 3.0).",
+    )
+    parser.add_argument(
         "--sym",
         default=0.0,
         type=float,

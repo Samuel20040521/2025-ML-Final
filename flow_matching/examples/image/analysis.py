@@ -5,6 +5,8 @@ import matplotlib.pyplot as plt
 import torch.nn.functional as F
 from torchvision.utils import save_image
 from models.model_configs import instantiate_model
+from flow_matching.path.scheduler import CondOTScheduler, PowerLawScheduler, ScheduleTransformedModel
+from training.time_schedules import get_time_schedule, AVAILABLE_SCHEDULES
 import numpy as np
 import os
 from pathlib import Path
@@ -58,14 +60,43 @@ def generate_samples_with_analysis(
     image_size=32,
     device="cuda",
     step_size=0.01,
+    time_grid=None,
     return_latent_trajectory=False,
     return_final_latent=False,
 ):
-    """Generate samples using midpoint method (matching original ODESolver behavior)."""
+    """
+    Generate samples using midpoint method (matching original ODESolver behavior).
+    
+    Args:
+        model: The velocity model.
+        num_samples: Number of samples to generate.
+        image_size: Size of the generated images.
+        device: Device to run on.
+        step_size: Uniform step size (used only if time_grid is None).
+        time_grid: Optional explicit time grid tensor of shape (num_steps + 1,).
+                   If provided, step_size is ignored and variable dt is used.
+        return_latent_trajectory: Whether to return intermediate latents.
+        return_final_latent: Whether to return the final latent.
+    
+    Returns:
+        samples: Generated image samples.
+        analysis: Dictionary with velocity field analysis metrics.
+    """
     model.eval()
     
-    num_steps = int(1.0 / step_size)
-    print(f"Using {num_steps} ODE steps (step_size={step_size})")
+    # Determine time grid
+    if time_grid is not None:
+        # Use explicit time grid (Phase 1: pure discretization)
+        time_grid = time_grid.to(device)
+        num_steps = len(time_grid) - 1
+        print(f"Using explicit time grid with {num_steps} ODE steps")
+        print(f"Time grid: {time_grid.cpu().tolist()[:5]}...{time_grid.cpu().tolist()[-2:]}")
+    else:
+        # Fall back to uniform step_size (backward compatibility)
+        num_steps = int(1.0 / step_size)
+        time_grid = torch.linspace(0.0, 1.0, num_steps + 1, device=device)
+        print(f"Using uniform time grid with {num_steps} ODE steps (step_size={step_size})")
+    
     print(f"Total model evaluations: {num_steps * 2} (midpoint method)")
     
     # Start from random noise at t=0 (same as original)
@@ -88,9 +119,10 @@ def generate_samples_with_analysis(
     
     with torch.no_grad():
         for i in range(num_steps):
-            t = i * step_size
-            t_next = (i + 1) * step_size
-            dt = step_size
+            # Use time_grid for variable dt support (Phase 1)
+            t = time_grid[i].item()
+            t_next = time_grid[i + 1].item()
+            dt = t_next - t
             t_mid = t + dt / 2
             
             # Track latent at evaluation time (before velocity call)
@@ -185,11 +217,32 @@ def run_multi_batch_analysis(
     image_size=32,
     device="cuda",
     step_size=0.01,
+    time_grid=None,
 ):
-    """Run inference over multiple batches and aggregate cosine similarity analysis."""
+    """
+    Run inference over multiple batches and aggregate cosine similarity analysis.
     
+    Args:
+        model: The velocity model.
+        total_samples: Total number of samples to generate.
+        batch_size: Number of samples per batch.
+        image_size: Size of generated images.
+        device: Device to run on.
+        step_size: Uniform step size (used only if time_grid is None).
+        time_grid: Optional explicit time grid tensor. If provided, step_size is ignored.
+    
+    Returns:
+        all_samples: All generated samples.
+        aggregated_analysis: Dictionary with aggregated analysis metrics.
+    """
     num_batches = (total_samples + batch_size - 1) // batch_size
-    num_steps = int(1.0 / step_size)
+    
+    # Determine number of steps from time_grid or step_size
+    if time_grid is not None:
+        num_steps = len(time_grid) - 1
+    else:
+        num_steps = int(1.0 / step_size)
+    
     num_evals = num_steps * 2 - 1  # Number of cosine similarity comparisons
     
     print(f"Running {num_batches} batches of {batch_size} samples each")
@@ -219,6 +272,7 @@ def run_multi_batch_analysis(
             image_size=image_size,
             device=device,
             step_size=step_size,
+            time_grid=time_grid,
         )
         
         all_samples.append(samples.cpu())
@@ -248,12 +302,19 @@ def run_multi_batch_analysis(
     curvature_values = all_per_sample_curvs.permute(1, 0, 2).reshape(num_evals, -1)
     all_cos_values = all_per_sample_cos_sims.permute(1, 0, 2).reshape(num_evals, -1)
 
+    # Handle single-batch case where std returns NaN
+    def safe_std(tensor, dim):
+        """Compute std, returning zeros if only one sample (avoids NaN)."""
+        if tensor.shape[dim] <= 1:
+            return torch.zeros(tensor.shape[1] if dim == 0 else tensor.shape[0])
+        return tensor.std(dim=dim)
+
     aggregated_analysis = {
         "eval_times": eval_times,
         "eval_types": eval_types,
         # Per-step statistics across all batches
         "cos_sim_per_step_mean": all_batch_cos_sims.mean(dim=0).tolist(),  # (num_evals,)
-        "cos_sim_per_step_std": all_batch_cos_sims.std(dim=0).tolist(),    # (num_evals,)
+        "cos_sim_per_step_std": safe_std(all_batch_cos_sims, dim=0).tolist(),    # (num_evals,)
         # All per-sample cosine similarities: (num_batches * batch_size, num_evals)
         "all_per_sample_cos_sims": all_cos_values,
         # Curvature statistics
@@ -262,7 +323,7 @@ def run_multi_batch_analysis(
         "all_curvature_values": curvature_values,
         # Velocity norms
         "vel_norm_per_step_mean": all_vel_norms.mean(dim=0).tolist(),
-        "vel_norm_per_step_std": all_vel_norms.std(dim=0).tolist(),
+        "vel_norm_per_step_std": safe_std(all_vel_norms, dim=0).tolist(),
         # Metadata
         "num_batches": num_batches,
         "batch_size": batch_size,
@@ -415,6 +476,9 @@ def plot_multi_batch_analysis(analysis, output_dir):
     angle_min = all_angles.min()
     angle_max = all_angles.max()
     angle_margin = (angle_max - angle_min) * 0.05
+    # Avoid zero-width ranges when all angles are identical
+    if angle_margin == 0:
+        angle_margin = max(1.0, abs(angle_max) * 0.05 + 1e-3)
     angle_ylim = (max(0, angle_min - angle_margin), angle_max + angle_margin)
     
     # === Create figure with 4x2 subplots (ALL using angles) ===
@@ -490,14 +554,18 @@ def plot_multi_batch_analysis(analysis, output_dir):
     # Plot 5: Velocity norm with std band
     ax5 = axes[2, 0]
     x_axis_vel = range(len(vel_mean))
-    vel_min = min([m - s for m, s in zip(vel_mean, vel_std)])
-    vel_max = max([m + s for m, s in zip(vel_mean, vel_std)])
+    # Handle NaN in std (single batch case)
+    vel_std_safe = [s if not np.isnan(s) else 0 for s in vel_std]
+    vel_min = min([m - s for m, s in zip(vel_mean, vel_std_safe)])
+    vel_max = max([m + s for m, s in zip(vel_mean, vel_std_safe)])
     vel_margin = (vel_max - vel_min) * 0.05
+    if vel_margin == 0 or np.isnan(vel_margin):
+        vel_margin = max(1e-3, abs(vel_max) * 0.05)
     vel_ylim = (max(0, vel_min - vel_margin), vel_max + vel_margin)
     
     ax5.fill_between(x_axis_vel,
-                     [m - s for m, s in zip(vel_mean, vel_std)],
-                     [m + s for m, s in zip(vel_mean, vel_std)],
+                     [m - s for m, s in zip(vel_mean, vel_std_safe)],
+                     [m + s for m, s in zip(vel_mean, vel_std_safe)],
                      alpha=0.3, color='red')
     ax5.plot(x_axis_vel, vel_mean, 'r-', linewidth=1.5, label='Mean ± Std')
     ax5.set_xlabel('Evaluation Index')
@@ -525,6 +593,8 @@ def plot_multi_batch_analysis(analysis, output_dir):
     curv_min = min([m - s for m, s in zip(curv_mean, curv_std)])
     curv_max = max([m + s for m, s in zip(curv_mean, curv_std)])
     curv_margin = (curv_max - curv_min) * 0.05
+    if curv_margin == 0:
+        curv_margin = max(1e-3, abs(curv_max) * 0.05)
     curv_ylim = (max(0, curv_min - curv_margin), curv_max + curv_margin)
     ax7.fill_between(x_axis_curv,
                      [m - s for m, s in zip(curv_mean, curv_std)],
@@ -557,10 +627,24 @@ def plot_multi_batch_analysis(analysis, output_dir):
     
     # Save summary to text file
     summary_path = os.path.join(output_dir, "summary.txt")
+    def safe_mean_std(tensor):
+        if tensor.numel() == 0:
+            return None, None
+        return tensor.mean().item(), tensor.std().item()
+
     n = len(cos_mean)
-    early_angles = all_angles_tensor[:n//3].flatten()
-    mid_angles_phase = all_angles_tensor[n//3:2*n//3].flatten()
-    late_angles = all_angles_tensor[2*n//3:].flatten()
+    if n >= 3:
+        early_angles = all_angles_tensor[: n // 3].flatten()
+        mid_angles_phase = all_angles_tensor[n // 3 : 2 * n // 3].flatten()
+        late_angles = all_angles_tensor[2 * n // 3 :].flatten()
+    else:
+        # Fall back to a single bucket when we have too few evals
+        early_angles = all_angles_tensor.flatten()
+        mid_angles_phase = torch.tensor([], device=all_angles_tensor.device)
+        late_angles = torch.tensor([], device=all_angles_tensor.device)
+    early_mean, early_std = safe_mean_std(early_angles)
+    mid_mean, mid_std = safe_mean_std(mid_angles_phase)
+    late_mean, late_std = safe_mean_std(late_angles)
     curv_mean_global = all_curv_flat.mean()
     curv_std_global = all_curv_flat.std()
     curv_min = all_curv_flat.min()
@@ -573,6 +657,26 @@ def plot_multi_batch_analysis(analysis, output_dir):
         f.write(f"Total samples: {total_samples}\n")
         f.write(f"ODE steps: {analysis['num_steps']}\n")
         f.write(f"Total evaluations per sample: {analysis['num_evaluations']}\n")
+        
+        # Phase 1: Record schedule information
+        schedule_info = analysis.get("schedule_info", {})
+        if schedule_info:
+            f.write(f"\nTime Schedule Configuration:\n")
+            f.write(f"  Type: {schedule_info.get('type', 'unknown')}\n")
+            if 'num_steps' in schedule_info:
+                f.write(f"  Num steps: {schedule_info['num_steps']}\n")
+            if schedule_info.get('gamma') is not None:
+                f.write(f"  Gamma: {schedule_info['gamma']}\n")
+            if 'step_size' in schedule_info:
+                f.write(f"  Step size: {schedule_info['step_size']}\n")
+            if schedule_info.get('legacy_time_warp', {}).get('enabled'):
+                f.write(f"  [LEGACY] Velocity scaling enabled (gamma={schedule_info['legacy_time_warp']['gamma']})\n")
+            if 'time_grid' in schedule_info:
+                tg = schedule_info['time_grid']
+                f.write(f"  Time grid summary: [{tg[0]:.8f}, ..., {tg[-1]:.8f}] ({len(tg)} points)\n")
+                # Write full time grid for reproducibility
+                f.write(f"  Time grid (full): {[f'{t:.8f}' for t in tg]}\n")
+        
         f.write(f"\nCosine Similarity:\n")
         f.write(f"  Mean: {all_cos_flat.mean():.4f}\n")
         f.write(f"  Std:  {all_cos_flat.std():.4f}\n")
@@ -602,9 +706,24 @@ def plot_multi_batch_analysis(analysis, output_dir):
                     f"  Per-anchor mean L2 error (main vs ref) over {len(anchor_mean)} anchors\n"
                 )
         f.write(f"\nPhase-wise Angular Difference:\n")
-        f.write(f"  Early (eval 0-{n//3}):    mean={early_angles.mean():.2f}°, std={early_angles.std():.2f}°\n")
-        f.write(f"  Mid   (eval {n//3}-{2*n//3}):  mean={mid_angles_phase.mean():.2f}°, std={mid_angles_phase.std():.2f}°\n")
-        f.write(f"  Late  (eval {2*n//3}-{n}): mean={late_angles.mean():.2f}°, std={late_angles.std():.2f}°\n")
+        f.write(
+            f"  Early (eval 0-{n//3}):    mean="
+            f"{early_mean:.2f}°, std={early_std:.2f}°\n"
+            if early_mean is not None
+            else "  Early: N/A (insufficient evaluations)\n"
+        )
+        f.write(
+            f"  Mid   (eval {n//3}-{2*n//3}):  mean="
+            f"{mid_mean:.2f}°, std={mid_std:.2f}°\n"
+            if mid_mean is not None
+            else "  Mid: N/A (insufficient evaluations)\n"
+        )
+        f.write(
+            f"  Late  (eval {2*n//3}-{n}): mean="
+            f"{late_mean:.2f}°, std={late_std:.2f}°\n"
+            if late_mean is not None
+            else "  Late: N/A (insufficient evaluations)\n"
+        )
     
     print(f"Saved summary to {summary_path}")
     
@@ -699,12 +818,44 @@ def main():
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size for each inference run")
     parser.add_argument("--output", default="./inference_output", help="Output directory for all generated files")
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--step_size", type=float, default=0.01)
+    parser.add_argument("--step_size", type=float, default=0.01, help="Uniform step size (ignored if --num_steps and --time_schedule are provided)")
     parser.add_argument("--save_all_samples", action="store_true", help="Save all generated samples (can be large)")
     parser.add_argument("--ref_step_size", type=float, default=None, help="Optional smaller step size for reference trajectory")
     parser.add_argument("--ref_max_batches", type=int, default=1, help="Number of batches to compare with reference trajectory")
     parser.add_argument("--ref_seed", type=int, default=12345, help="Seed for aligning main and reference trajectories")
+    
+    # Phase 1: Pure time-grid schedules (NO velocity scaling)
+    parser.add_argument("--num_steps", type=int, default=None, 
+                        help="Number of ODE steps. If provided with --time_schedule, uses pure time-grid discretization.")
+    parser.add_argument("--time_schedule", type=str, default=None, choices=AVAILABLE_SCHEDULES,
+                        help=f"Time schedule type: {', '.join(AVAILABLE_SCHEDULES)}. Requires --num_steps.")
+    parser.add_argument("--schedule_gamma", type=float, default=3.0,
+                        help="Gamma exponent for front_dense/back_dense schedules (default: 3.0)")
+    
+    # Legacy: time warp with velocity scaling (Phase 0)
+    parser.add_argument("--time_warp_enable", action="store_true", 
+                        help="[LEGACY] Enable power-law time warp with velocity scaling (uses ScheduleTransformedModel)")
+    parser.add_argument("--time_warp_power", type=float, default=None, 
+                        help="[LEGACY] Gamma exponent for power-law time warp; defaults to 3.0 when enabled")
     args = parser.parse_args()
+    
+    # === Argument Validation ===
+    # Critical: Ensure num_steps >= 1 when provided
+    if args.num_steps is not None and args.num_steps < 1:
+        parser.error("--num_steps must be >= 1")
+    
+    # time_schedule requires num_steps
+    if args.time_schedule is not None and args.num_steps is None:
+        parser.error("--time_schedule requires --num_steps to be specified")
+    
+    # Cannot mix legacy time_warp with Phase 1 time_schedule
+    if args.time_warp_enable and args.time_schedule is not None:
+        parser.error("Cannot use both --time_warp_enable (legacy velocity scaling) and --time_schedule (pure discretization)")
+    
+    # Warn if both step_size and num_steps are provided (num_steps takes priority)
+    if args.num_steps is not None and args.step_size != 0.01:  # 0.01 is the default
+        print(f"WARNING: Both --step_size ({args.step_size}) and --num_steps ({args.num_steps}) provided. "
+              f"Using --num_steps (--step_size will be ignored).")
     
     device = torch.device(args.device)
     
@@ -723,16 +874,72 @@ def main():
     # Load checkpoint
     model = load_checkpoint(model, args.checkpoint)
     model.to(device)
+
+    velocity_model = model
+    
+    # Phase 1: Build pure time grid (NO velocity scaling)
+    time_grid = None
+    schedule_info = {"type": "uniform_step_size", "step_size": args.step_size}
+    
+    if args.time_schedule is not None and args.num_steps is not None:
+        # Pure discretization: only change time grid, not velocity
+        time_grid = get_time_schedule(
+            schedule_name=args.time_schedule,
+            num_steps=args.num_steps,
+            gamma=args.schedule_gamma,
+            device=device,
+        )
+        # Store with high precision for reproducibility
+        time_grid_list = [round(t, 8) for t in time_grid.cpu().tolist()]
+        schedule_info = {
+            "type": args.time_schedule,
+            "num_steps": args.num_steps,
+            "gamma": args.schedule_gamma if args.time_schedule in ["front_dense", "back_dense"] else None,
+            "time_grid": time_grid_list,
+        }
+        print(f"Phase 1: Using pure '{args.time_schedule}' time schedule with {args.num_steps} steps")
+        print(f"Time grid (full): {time_grid_list}")
+    elif args.num_steps is not None:
+        # num_steps provided without schedule => uniform with num_steps
+        time_grid = get_time_schedule("uniform", args.num_steps, device=device)
+        time_grid_list = [round(t, 8) for t in time_grid.cpu().tolist()]
+        schedule_info = {
+            "type": "uniform",
+            "num_steps": args.num_steps,
+            "time_grid": time_grid_list,
+        }
+        print(f"Phase 1: Using uniform time schedule with {args.num_steps} steps")
+        print(f"Time grid (full): {time_grid_list}")
+    
+    # Legacy: time warp with velocity scaling (Phase 0)
+    if args.time_warp_enable:
+        gamma = args.time_warp_power if args.time_warp_power is not None else 3.0
+        original_scheduler = CondOTScheduler()
+        new_scheduler = PowerLawScheduler(base_scheduler=original_scheduler, gamma=gamma)
+        velocity_model = ScheduleTransformedModel(
+            velocity_model=model,
+            original_scheduler=original_scheduler,
+            new_scheduler=new_scheduler,
+        )
+        schedule_info["legacy_time_warp"] = {"enabled": True, "gamma": gamma}
+        print(f"[LEGACY] Using power-law time warp with velocity scaling (gamma={gamma})")
+    
+    if hasattr(velocity_model, "to"):
+        velocity_model.to(device)
     
     # Run multi-batch analysis
     print(f"Generating {args.total_samples} samples in batches of {args.batch_size}...")
     all_samples, analysis = run_multi_batch_analysis(
-        model,
+        velocity_model,
         total_samples=args.total_samples,
         batch_size=args.batch_size,
         device=device,
         step_size=args.step_size,
+        time_grid=time_grid,
     )
+    
+    # Add schedule info to analysis metadata
+    analysis["schedule_info"] = schedule_info
 
     # Optional reference trajectory comparison
     num_batches_main = (args.total_samples + args.batch_size - 1) // args.batch_size
@@ -740,7 +947,7 @@ def main():
         ref_batches = min(args.ref_max_batches, num_batches_main)
         print(f"Running reference comparison on {ref_batches} batch(es) with step_size={args.ref_step_size} and seed base {args.ref_seed}")
         reference_comparison = run_reference_comparison(
-            model,
+            velocity_model,
             batch_size=args.batch_size,
             image_size=analysis.get("image_size", 32) if isinstance(analysis, dict) else 32,
             device=device,

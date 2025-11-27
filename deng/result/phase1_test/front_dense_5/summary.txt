@@ -1,0 +1,36 @@
+=== Multi-Batch Velocity Field Analysis ===
+Total batches: 4
+Batch size: 64
+Total samples: 256
+ODE steps: 5
+Total evaluations per sample: 10
+
+Time Schedule Configuration:
+  Type: front_dense
+  Num steps: 5
+  Gamma: 3.0
+  Time grid summary: [0.00000000, ..., 1.00000000] (6 points)
+  Time grid (full): ['0.00000000', '0.00800000', '0.06400000', '0.21600002', '0.51200002', '1.00000000']
+
+Cosine Similarity:
+  Mean: 0.9958
+  Std:  0.0042
+  Min:  0.9618
+  Max:  1.0000
+
+Angular Difference:
+  Mean: 4.49°
+  Std:  2.78°
+  Min: 0.18°
+  Max: 15.89°
+
+Curvature (L2 difference between consecutive velocities):
+  Mean: 4.5272
+  Std:  2.8406
+  Min:  0.1876
+  Max:  15.8511
+
+Phase-wise Angular Difference:
+  Early (eval 0-3):    mean=2.11°, std=2.59°
+  Mid   (eval 3-6):  mean=5.53°, std=2.27°
+  Late  (eval 6-9): mean=5.84°, std=1.66°
