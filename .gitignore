@@ -3,3 +3,4 @@
 *.pt
 
 ./deng/result/*/deng/result/
+/deng/result/
