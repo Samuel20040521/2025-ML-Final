@@ -8,8 +8,15 @@ from torchdyn.core import NeuralODE
 # from torchvision.transforms import ToPILImage
 from torchvision.utils import save_image
 
+
+def get_device():
+    """Get the device to use for training and inference."""
+    use_cuda = torch.cuda.is_available()
+    return torch.device("cuda:2" if use_cuda else "cpu")
+
+
 use_cuda = torch.cuda.is_available()
-device = torch.device("cuda" if use_cuda else "cpu")
+device = get_device()
 
 
 def setup(
