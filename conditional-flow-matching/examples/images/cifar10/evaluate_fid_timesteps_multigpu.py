@@ -1,54 +1,31 @@
 import os
-import json
-import math
 import argparse
+import json
+import numpy as np
+import math
 from tqdm import tqdm
 from PIL import Image
 import matplotlib.pyplot as plt
 import shutil
-import numpy as np
 
 import torch
 import torch.distributed as dist
 import torch_fidelity
 
-from torchcfm.models.unet.unet import UNetModelWrapper
+from unet import SongUNet
+from meanflow_sampler import meanflow_sampler
 
-def generate_timestep_list(N=40, gamma=0.5, device='cpu'):
-    k = torch.arange(0, N+1, device=device)
+def generate_timestep_list(N=40, gamma=0.5):
+    k = torch.arange(0, N+1)
     s = k / float(N)  # [0,1] uniform
     t = 0.5 + 0.5 * torch.sign(s - 0.5) * torch.abs(2*s - 1)**gamma
     return t  # shape [N+1]
 
-def integrate_model_with_traj(model, x0, timesteps, device):
-    """
-    Manual Euler integration with custom timesteps.
-    timesteps: Tensor of shape [T+1]
-    """
-    xs = [x0]
-    vs = []
-    x = x0
-
-    for i in range(len(timesteps) - 1):
-        t_curr = timesteps[i]
-        t_next = timesteps[i+1]
-        dt = t_next - t_curr
-        
-        # Expand t for batch
-        t_input = t_curr.view(1, 1, 1, 1).expand(x.size(0), 1, 1, 1)
-        
-        v = model(t_input, x)
-        vs.append(v)
-        x = x + dt * v
-        xs.append(x)
-
-    xs = torch.stack(xs, dim=1)
-    vs = torch.stack(vs, dim=1)
-    return xs, vs
-
 def run_sampling_and_fid(args, model, device, num_steps, use_uniform=True, rank=0, world_size=1):
     # Reset seed to ensure same latents across different runs (per rank)
-    torch.manual_seed(args.global_seed + rank)
+    # Each rank gets a different seed offset to ensure diversity across GPUs
+    # but consistency across runs for the same rank
+    torch.manual_seed(args.seed + rank)
     
     mode_str = "uniform" if use_uniform else "non-uniform"
     if rank == 0:
@@ -61,25 +38,30 @@ def run_sampling_and_fid(args, model, device, num_steps, use_uniform=True, rank=
     if rank == 0:
         os.makedirs(img_folder, exist_ok=True)
     
+    # Wait for directory creation
     if world_size > 1:
         dist.barrier()
     
     # Determine timesteps
     if use_uniform:
-        timesteps = torch.linspace(0, 1, num_steps + 1, device=device)
+        timesteps = None # meanflow_sampler defaults to uniform
     else:
-        timesteps = generate_timestep_list(N=num_steps, gamma=0.5, device=device)
+        timesteps = generate_timestep_list(N=num_steps, gamma=0.5).to(device)
     
     # Sampling workload distribution
     total_samples = args.num_fid_samples
     samples_per_gpu = int(math.ceil(total_samples / world_size))
     
-    n = args.per_proc_batch_size
+    # Adjust last GPU if total doesn't divide evenly (though ceil usually handles over-provisioning)
+    # Simple approach: each GPU does samples_per_gpu, we might generate slightly more than total_samples
+    
+    n = args.batch_size
     iterations = int(math.ceil(samples_per_gpu / n))
     
     if rank == 0:
         print(f"Sampling {total_samples} images across {world_size} GPUs ({samples_per_gpu} per GPU)...")
     
+    # Use tqdm only on rank 0 to avoid clutter
     iterator = range(iterations)
     if rank == 0:
         iterator = tqdm(iterator)
@@ -93,25 +75,30 @@ def run_sampling_and_fid(args, model, device, num_steps, use_uniform=True, rank=
         z = torch.randn(current_batch_size, 3, 32, 32, device=device)
         
         with torch.no_grad():
-            xs, _ = integrate_model_with_traj(
-                model=model,
-                x0=z,
-                timesteps=timesteps,
-                device=device
+            samples = meanflow_sampler(
+                model=model, 
+                latents=z,
+                cfg_scale=1.0,
+                num_steps=num_steps,
+                timesteps=timesteps
             )
-            xT = xs[:, -1]
             
-            # Post-process images
-            imgs = (xT * 127.5 + 128).clamp(0, 255).permute(0, 2, 3, 1)
-            imgs = imgs.to("cpu", dtype=torch.uint8).numpy()
+            samples = (samples + 1) / 2.0
+            samples = torch.clamp(255.0 * samples, 0, 255)
+            samples = samples.permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
             
-            for i, img in enumerate(imgs):
+            for i, sample in enumerate(samples):
+                # Unique index across all GPUs
+                # Global index = (rank * samples_per_gpu) + local_index
                 index = (rank * samples_per_gpu) + total_generated + i
+                
+                # Only save if we haven't exceeded the requested total (optional, but cleaner)
                 if index < total_samples:
-                    Image.fromarray(img).save(f"{img_folder}/{index:06d}.png")
+                    Image.fromarray(sample).save(f"{img_folder}/{index:06d}.png")
         
         total_generated += current_batch_size
         
+    # Wait for all GPUs to finish sampling
     if world_size > 1:
         dist.barrier()
         
@@ -119,15 +106,6 @@ def run_sampling_and_fid(args, model, device, num_steps, use_uniform=True, rank=
     fid = 0.0
     if rank == 0:
         print("Computing FID...")
-        # Allow torch.load cached stats with PyTorch>=2.6 safe globals
-        try:
-            import torch.serialization as _ts
-            import numpy as _np
-            if hasattr(_ts, "add_safe_globals"):
-                _ts.add_safe_globals([_np._core.multiarray._reconstruct])
-        except Exception:
-            pass
-
         metrics_args = {
             'input1': img_folder,
             'input2': 'cifar10-train' if args.fid_ref == 'train' else 'cifar10-test',
@@ -141,10 +119,8 @@ def run_sampling_and_fid(args, model, device, num_steps, use_uniform=True, rank=
         metrics_dict = torch_fidelity.calculate_metrics(**metrics_args)
         fid = metrics_dict.get('frechet_inception_distance', None)
         print(f"FID ({mode_str}, N={num_steps}): {fid:.2f}")
-        
-        # Optional: Cleanup images to save space
-        # shutil.rmtree(img_folder)
     
+    # Broadcast FID to all ranks (optional, mostly for return consistency)
     if world_size > 1:
         fid_tensor = torch.tensor([fid if fid is not None else 0.0], device=device)
         dist.broadcast(fid_tensor, src=0)
@@ -154,28 +130,17 @@ def run_sampling_and_fid(args, model, device, num_steps, use_uniform=True, rank=
 
 def main():
     parser = argparse.ArgumentParser()
-    # Model/ckpt
-    parser.add_argument("--ckpt", type=str, default="", help="Path to checkpoint (.pt).")
-    parser.add_argument("--input-dir", type=str, default="./results", help="Base directory for checkpoints")
-    parser.add_argument("--model", type=str, default="icfm", help="Model name")
-    parser.add_argument("--step", type=int, default=400000, help="Training step")
-    parser.add_argument("--num_channel", type=int, default=128, help="Base channel of UNet")
-    
-    # Output
-    parser.add_argument("--output_dir", type=str, default="fid_comparison_results")
-    
-    # Sampling
-    parser.add_argument("--global-seed", type=int, default=42)
-    parser.add_argument("--per-proc-batch-size", type=int, default=100)
-    parser.add_argument("--num-fid-samples", type=int, default=10000)
+    parser.add_argument("--ckpt", type=str, required=True, help="Path to checkpoint")
+    parser.add_argument("--output_dir", type=str, default="fid_evaluation_results")
+    parser.add_argument("--batch_size", type=int, default=100)
+    parser.add_argument("--num_fid_samples", type=int, default=50000)
     parser.add_argument("--fid_ref", type=str, default="train", choices=["train", "test"])
-    
-    # DDP
+    parser.add_argument("--seed", type=int, default=42)
+    # DDP args
     parser.add_argument("--local_rank", type=int, default=0)
-    
     args = parser.parse_args()
     
-    # Initialize DDP
+    # Initialize Distributed Process Group
     if "WORLD_SIZE" in os.environ:
         dist.init_process_group("nccl")
         rank = dist.get_rank()
@@ -191,34 +156,24 @@ def main():
     
     if rank == 0:
         print(f"Initialized DDP with world_size={world_size}")
-        os.makedirs(args.output_dir, exist_ok=True)
     
     # Load Model
-    model = UNetModelWrapper(
-        dim=(3, 32, 32),
-        num_res_blocks=2,
-        num_channels=args.num_channel,
-        channel_mult=[1, 2, 2, 2],
-        num_heads=4,
-        num_head_channels=64,
-        attention_resolutions="16",
-        dropout=0.1,
+    if rank == 0:
+        print("Loading model...")
+        
+    model = SongUNet(
+        img_resolution=32,
+        in_channels=3,
+        out_channels=3,
+        label_dim=0,
     ).to(device)
     
     # Load checkpoint
-    if args.ckpt:
-        ckpt_path = args.ckpt
+    checkpoint = torch.load(args.ckpt, map_location=device, weights_only=True)
+    if 'ema' in checkpoint:
+        state_dict = checkpoint['ema']
     else:
-        ckpt_path = os.path.join(args.input_dir, args.model,
-                                 f"{args.model}_cifar10_weights_step_{args.step}.pt")
-                                 
-    if rank == 0:
-        print(f"Loading checkpoint: {ckpt_path}")
-        
-    checkpoint = torch.load(ckpt_path, map_location=device)
-    state_dict = checkpoint.get("ema_model", checkpoint)
-    if any(k.startswith("module.") for k in state_dict.keys()):
-        state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
+        state_dict = checkpoint
     model.load_state_dict(state_dict)
     model.eval()
     
@@ -244,6 +199,7 @@ def main():
         
         # Save intermediate results (Rank 0 only)
         if rank == 0:
+            os.makedirs(args.output_dir, exist_ok=True)
             with open(os.path.join(args.output_dir, "results.json"), "w") as f:
                 json.dump(results, f, indent=4)
             
