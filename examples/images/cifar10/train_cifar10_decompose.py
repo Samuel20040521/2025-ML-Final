@@ -1,6 +1,6 @@
 # Inspired from https://github.com/w86763777/pytorch-ddpm/tree/master.
 # Authors: Kilian Fatras, Alexander Tong
-# Modified: use UNetModel_Decompose_Wrapper and a decomposed loss (norm + angle + vector).
+# Modified: Bottleneck Split Architecture with Hybrid Loss Strategy
 
 import copy
 import json
@@ -20,13 +20,13 @@ from torchcfm.conditional_flow_matching import (
     TargetConditionalFlowMatcher,
     VariancePreservingConditionalFlowMatcher,
 )
-# 這裡假設你的 UNetModel_Decompose_Wrapper 就放在 torchcfm.models.unet.unet 裡
+# [重要] 確保這裡 import 到的是你剛剛修改過包含 BottleneckEnergyHead 的新模型
 from torchcfm.models.unet.unet import UNetModel_Decompose_Wrapper
 
 FLAGS = flags.FLAGS
 
 flags.DEFINE_string("model", "otcfm", help="flow matching model type")
-flags.DEFINE_string("output_dir", "./results_decompose/", help="output_directory")
+flags.DEFINE_string("output_dir", "./results_bottleneck_final/", help="output_directory")
 # UNet
 flags.DEFINE_integer("num_channel", 128, help="base channel of UNet")
 
@@ -47,13 +47,16 @@ flags.DEFINE_integer(
     help="frequency of saving checkpoints, 0 to disable during training",
 )
 
-# Decomposition loss weights
-flags.DEFINE_float("lambda_vec", 1.0, help="weight for vector reconstruction loss")
-flags.DEFINE_float("lambda_r", 0.1, help="weight for magnitude loss")
-flags.DEFINE_float("lambda_dir", 0.1, help="weight for direction (angular) loss")
+# === Decomposition Loss Weights (Recommended Strategy) ===
+# lambda_vec: 1.0   -> 總重建 Loss (裁判)，確保最終合成結果正確，並提供對能量強區域的注意力。
+# lambda_energy: 0.1 -> 能量 Loss (營養師)，因為 scalar 很好學，設小一點避免搶走梯度。
+# lambda_shape: 1.0 -> 形狀 Loss (教練)，專門糾正方向和紋理，解決模糊問題。
+flags.DEFINE_float("lambda_vec", 1.0, help="weight for total reconstruction loss")
+flags.DEFINE_float("lambda_energy", 0.1, help="weight for energy (scalar) loss")
+flags.DEFINE_float("lambda_shape", 1.0, help="weight for shape (spatial) loss")
 
 use_cuda = torch.cuda.is_available()
-device = torch.device("cuda:2" if use_cuda else "cpu")
+device = torch.device("cuda:1" if use_cuda else "cpu")
 
 
 def warmup_lr(step):
@@ -132,34 +135,49 @@ def build_model():
     return net_model, ema_model
 
 
-def decompose_loss(v_pred, r_pred, d_pred, u_target):
+def decompose_loss_bottleneck(v_pred, energy_pred, shape_pred, u_target):
     """
-    v_pred: [B, C, H, W]  (model output vector field = r * d_pred)
-    r_pred: [B, 1, H, W]        (pixel-wise magnitude)
-    d_pred: [B, C, H, W]  (unit direction field)
-    u_target: [B, C, H, W] (ground-truth flow from FM)
+    計算解耦後的 Loss。
+    
+    Args:
+        v_pred:      [B, C, H, W]  (Combined output = shape * energy)
+        energy_pred: [B, C]        (Predicted Scalars per channel)
+        shape_pred:  [B, C, H, W]  (Predicted Spatial Map, normalized along H,W)
+        u_target:    [B, C, H, W]  (Ground Truth Flow)
     """
-
-    B, C, H, W = u_target.shape
-    eps = 1e-8
-
-    # 1. vector-level MSE (跟原本一樣的 flow matching loss)
+    
+    # 1. Vector-level MSE (The "Referee" Loss)
+    # 確保最終合成結果與目標一致，這隱含了對高能量區域的關注。
     loss_vec = F.mse_loss(v_pred, u_target)
 
-    # 2. magnitude target: 把每個 pixel 的向量長度取 norm，再對 (H, W) 做平均 -> 得到一個 per-sample scalar
-    u_norm_per_pix = u_target.norm(dim=1)  # [B, H, W]
+    # --- Prepare Ground Truth Decomposition ---
     
-    r_pred_flat = r_pred.squeeze(1)  # [B, H, W]
-    loss_r = F.mse_loss(r_pred_flat, u_norm_per_pix)
-    # 3. direction target: 單位向量場
-    u_unit = u_target / (u_norm_per_pix.unsqueeze(1) + eps)  # [B, C, H, W]
+    # Target Energy: 計算 GT 在空間維度 (H, W) 上的總能量
+    # [B, C, H, W] -> [B, C]
+    target_energy = torch.norm(u_target, p=2, dim=(2, 3))
+    
+    # Target Shape: 計算 GT 的空間歸一化形狀
+    # 加上 eps 避免全黑背景導致除以零
+    eps = 1e-8
+    # Broadcast energy: [B, C] -> [B, C, 1, 1]
+    target_shape = u_target / (target_energy.view(*target_energy.shape, 1, 1) + eps)
+    
+    # --- Calculate Component Losses ---
 
-    # cosine similarity on each pixel, 再平均 (1 - cos)
-    cos_sim = (d_pred * u_unit).sum(dim=1)  # [B, H, W]
-    loss_dir = 1.0 - cos_sim.mean()
+    # 2. Energy Loss (Scalar MSE) (The "Volume" Loss)
+    # 比較預測的總能量 vs 真實的總能量
+    loss_energy = F.mse_loss(energy_pred, target_energy)
+
+    # 3. Shape Loss (Spatial Cosine Similarity) (The "Structure" Loss)
+    # 由於 shape_pred 和 target_shape 都是在 (H, W) 空間上的 Unit Vectors
+    # Dot Product 就等於 Cosine Similarity (不需要再除 norm)
+    # Sum over H, W dimensions -> [B, C]
+    spatial_cosine = torch.sum(shape_pred * target_shape, dim=(2, 3))
     
+    # 我們希望 Cosine 越大越好 (接近 1)，所以 Loss = 1 - Mean(Cosine)
+    loss_shape = 1.0 - spatial_cosine.mean()
     
-    return loss_vec, loss_r, loss_dir
+    return loss_vec, loss_energy, loss_shape
 
 
 def train(argv):
@@ -171,10 +189,9 @@ def train(argv):
         FLAGS.save_step,
     )
     print(
-        "lambda_vec, lambda_r, lambda_dir:",
-        FLAGS.lambda_vec,
-        FLAGS.lambda_r,
-        FLAGS.lambda_dir,
+        "Weights -> Vec: {}, Energy: {}, Shape: {}".format(
+            FLAGS.lambda_vec, FLAGS.lambda_energy, FLAGS.lambda_shape
+        )
     )
 
     # DATA
@@ -189,7 +206,7 @@ def train(argv):
     FM = build_flow_matcher()
 
     # OUTPUT DIR
-    savedir = os.path.join(FLAGS.output_dir, FLAGS.model + "_decompose/")
+    savedir = os.path.join(FLAGS.output_dir, FLAGS.model + "_final/")
     os.makedirs(savedir, exist_ok=True)
 
     # Setup logging
@@ -207,8 +224,8 @@ def train(argv):
             "ema_decay": FLAGS.ema_decay,
             "grad_clip": FLAGS.grad_clip,
             "lambda_vec": FLAGS.lambda_vec,
-            "lambda_r": FLAGS.lambda_r,
-            "lambda_dir": FLAGS.lambda_dir,
+            "lambda_energy": FLAGS.lambda_energy,
+            "lambda_shape": FLAGS.lambda_shape,
             "num_channel": FLAGS.num_channel,
             "save_step": FLAGS.save_step,
             "start_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -219,11 +236,8 @@ def train(argv):
     with open(log_file, "w") as f:
         f.write(f"Training started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"Configuration:\n")
-        f.write(f"  Model: {FLAGS.model}\n")
-        f.write(f"  Learning rate: {FLAGS.lr}\n")
-        f.write(f"  Total steps: {FLAGS.total_steps}\n")
-        f.write(f"  Batch size: {FLAGS.batch_size}\n")
-        f.write(f"  Lambda weights - vec: {FLAGS.lambda_vec}, r: {FLAGS.lambda_r}, dir: {FLAGS.lambda_dir}\n")
+        f.write(f"  Model: {FLAGS.model} (Bottleneck Split)\n")
+        f.write(f"  Lambda weights - vec: {FLAGS.lambda_vec}, energy: {FLAGS.lambda_energy}, shape: {FLAGS.lambda_shape}\n")
         f.write(f"\n{'='*80}\n\n")
 
     with trange(FLAGS.total_steps, dynamic_ncols=True) as pbar:
@@ -237,16 +251,18 @@ def train(argv):
             # Conditional flow matching: sample t, x_t, u_t
             t, xt, ut = FM.sample_location_and_conditional_flow(x0, x1)  # xt, ut: [B, C, H, W]
 
-            # Model: predict decomposed flow
-            v_pred, r_pred, d_pred = net_model(t, xt)  # v: [B,C,H,W], r:[B,1], d:[B,C,H,W]
+            # Model Forward: predict decomposed components
+            # Returns: v_pred (combined), energy_pred (scalar), shape_pred (map)
+            v_pred, energy_pred, shape_pred = net_model(t, xt) 
 
-            # Decomposition loss
-            loss_vec, loss_r, loss_dir = decompose_loss(v_pred, r_pred, d_pred, ut)
+            # Calculate decomposed losses
+            loss_vec, loss_energy, loss_shape = decompose_loss_bottleneck(v_pred, energy_pred, shape_pred, ut)
 
+            # Weighted Sum
             loss = (
                 FLAGS.lambda_vec * loss_vec
-                + FLAGS.lambda_r * loss_r
-                + FLAGS.lambda_dir * loss_dir
+                + FLAGS.lambda_energy * loss_energy
+                + FLAGS.lambda_shape * loss_shape
             )
 
             loss.backward()
@@ -258,9 +274,9 @@ def train(argv):
             pbar.set_postfix(
                 dict(
                     loss=loss.item(),
-                    loss_vec=loss_vec.item(),
-                    loss_r=loss_r.item(),
-                    loss_dir=loss_dir.item(),
+                    l_vec=loss_vec.item(),
+                    l_egy=loss_energy.item(),
+                    l_shp=loss_shape.item(),
                 )
             )
 
@@ -270,19 +286,18 @@ def train(argv):
                     "step": step,
                     "loss": loss.item(),
                     "loss_vec": loss_vec.item(),
-                    "loss_r": loss_r.item(),
-                    "loss_dir": loss_dir.item(),
+                    "loss_energy": loss_energy.item(),
+                    "loss_shape": loss_shape.item(),
                     "lr": sched.get_last_lr()[0]
                 }
                 training_stats["training_history"].append(stats)
                 
-                # Append to text log
                 with open(log_file, "a") as f:
                     f.write(f"Step {step:>6d} | Loss: {loss.item():.6f} | "
-                           f"Vec: {loss_vec.item():.6f} | R: {loss_r.item():.6f} | "
-                           f"Dir: {loss_dir.item():.6f} | LR: {stats['lr']:.6e}\n")
+                           f"Vec: {loss_vec.item():.5f} | Egy: {loss_energy.item():.5f} | "
+                           f"Shp: {loss_shape.item():.5f} | LR: {stats['lr']:.2e}\n")
                 
-                # Save JSON every 1000 steps
+                # Save JSON less frequently
                 if step % 1000 == 0:
                     with open(json_log_file, "w") as f:
                         json.dump(training_stats, f, indent=2)
@@ -300,13 +315,13 @@ def train(argv):
                         "sched": sched.state_dict(),
                         "optim": optim.state_dict(),
                         "step": step,
+                        "args": FLAGS.flag_values_dict(), # Save args for easier resume
                     },
                     os.path.join(
                         savedir, f"{FLAGS.model}_cifar10_decompose_weights_step_{step}.pt"
                     ),
                 )
     
-    # Final save of training stats
     training_stats["config"]["end_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with open(json_log_file, "w") as f:
         json.dump(training_stats, f, indent=2)

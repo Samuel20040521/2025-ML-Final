@@ -631,9 +631,38 @@ class UNetModel(nn.Module):
         h = h.type(x.dtype)
         return self.out(h)
 
+# ==============================================================================
+#  New Helper Module for Bottleneck Energy Head
+# ==============================================================================
+
+class BottleneckEnergyHead(nn.Module):
+    def __init__(self, in_channels, out_channels=3):
+        super().__init__()
+        # Takes bottleneck features (B, C, H, W) -> Output Scalars (B, out_channels)
+        self.main = nn.Sequential(
+            # 1. GroupNorm for stability
+            nn.GroupNorm(32, in_channels),
+            # 2. Global Average Pooling (B, C, H, W) -> (B, C, 1, 1)
+            nn.AdaptiveAvgPool2d(1),
+            # 3. Flatten (B, C)
+            nn.Flatten(),
+            # 4. MLP
+            nn.Linear(in_channels, 128),
+            nn.SiLU(), 
+            nn.Linear(128, out_channels),
+            # 5. Softplus to ensure positive energy
+            nn.Softplus()
+        )
+
+    def forward(self, x):
+        return self.main(x)
+
+
 class UNetModel_Decompose(nn.Module):
     """
-        Norm & Angle decomposition UNet Model
+        Norm & Angle decomposition UNet Model with Bottleneck Split Architecture.
+        - Energy (Scalar) is predicted from the Bottleneck.
+        - Shape (Unit Vector Map) is predicted from the Decoder output.
     """
     def __init__(
         self,
@@ -772,7 +801,16 @@ class UNetModel_Decompose(nn.Module):
             ),
         )
         self._feature_size += ch
+        
+        # ======================================================================
+        # Branch A: Energy Head (Attached to Bottleneck)
+        # ======================================================================
+        # Note: 'ch' here is the channel dimension of the bottleneck
+        self.energy_head = BottleneckEnergyHead(ch, out_channels=out_channels)
 
+        # ======================================================================
+        # Branch B: Shape Decoder
+        # ======================================================================
         self.output_blocks = nn.ModuleList([])
         for level, mult in list(enumerate(channel_mult))[::-1]:
             for i in range(num_res_blocks + 1):
@@ -819,18 +857,11 @@ class UNetModel_Decompose(nn.Module):
                 self.output_blocks.append(TimestepEmbedSequential(*layers))
                 self._feature_size += ch
 
-        # Magnitude head - output spatial field [B, 1, H, W]
-        self.rhead = nn.Sequential(
+        # Standard Conv output for Shape Map (before normalization)
+        self.out = nn.Sequential(
             normalization(ch),
             nn.SiLU(),
-            zero_module(conv_nd(self.dims, input_ch, 1, 3, padding=1)),  # [B, 1, H, W]
-        )
-
-        # 方向分支還是用 conv，保留 spatial 結構
-        self.dir_head = nn.Sequential(
-            normalization(ch),
-            nn.SiLU(),
-            zero_module(conv_nd(self.dims, input_ch, self.out_channels, 3, padding=1)),
+            zero_module(conv_nd(dims, input_ch, out_channels, 3, padding=1)),
         )
 
     def convert_to_fp16(self):
@@ -870,33 +901,48 @@ class UNetModel_Decompose(nn.Module):
             assert y.shape == (x.shape[0],)
             emb = emb + self.label_emb(y)
 
+        # 1. Encoder
         h = x.type(self.dtype)
         for module in self.input_blocks:
             h = module(h, emb)
             hs.append(h)
+        
+        # 2. Bottleneck
         h = self.middle_block(h, emb)
+
+        # ==========================================
+        # Branch A: Energy Head (Scalars)
+        # ==========================================
+        # Calculate global energy directly from bottleneck
+        energy = self.energy_head(h) # (B, 3)
+
+        # ==========================================
+        # Branch B: Shape Decoder
+        # ==========================================
         for module in self.output_blocks:
             h = th.cat([h, hs.pop()], dim=1)
             h = module(h, emb)
         h = h.type(x.dtype)
-
-        # 1. magnitude field (spatial) - 保證非負
-        r_field = self.rhead(h)            # [B, 1, H, W]
-        r_field = F.softplus(r_field)      # ensure non-negative
-
-        # 2. direction field -> normalize to unit vectors
-        d = self.dir_head(h)               # [B, C, H, W]
-        d_norm = d / (d.norm(dim=1, keepdim=True) + 1e-8)
         
-        # 3. 組合成向量場 v = r * û
-        v = r_field * d_norm               # [B, C, H, W]
-        
-        # Return based on training mode
-        # During training: return all components for decomposed loss
-        # During inference: return only vector field for ODE solver
+        # Raw shape output (B, 3, H, W)
+        raw_shape = self.out(h)
+
+        # Spatial Normalization (Channel-wise Spatial Decomposition)
+        # Normalize along H, W dimensions (dim=2, 3) to get shape map
+        shape_normed = F.normalize(raw_shape, p=2, dim=(2, 3))
+
+        # ==========================================
+        # Combine
+        # ==========================================
+        # v = energy * shape
+        # energy (B, 3) -> (B, 3, 1, 1) broadcast
+        v = shape_normed * energy.view(-1, self.out_channels, 1, 1)
+
         if self.training:
-            return v, r_field, d_norm
+            # Return components for separate loss calculation
+            return v, energy, shape_normed
         else:
+            # Inference only
             return v
     
 class SuperResModel(UNetModel):
@@ -1261,6 +1307,6 @@ class UNetModel_Decompose_Wrapper(UNetModel_Decompose):
             x: [B, C, H, W] input tensor
             y: [B] class labels
         Output: 
-            v, r, d_norm
+            v (combined), energy, shape_normed
         """
         return super().forward(t, x, y=y)

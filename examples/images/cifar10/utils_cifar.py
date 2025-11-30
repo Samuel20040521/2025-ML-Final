@@ -12,7 +12,7 @@ from torchvision.utils import save_image
 def get_device():
     """Get the device to use for training and inference."""
     use_cuda = torch.cuda.is_available()
-    return torch.device("cuda:2" if use_cuda else "cpu")
+    return torch.device("cuda:1" if use_cuda else "cpu")
 
 
 use_cuda = torch.cuda.is_available()
