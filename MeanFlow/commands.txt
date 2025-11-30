@@ -1,0 +1,31 @@
+# With velocity analysis
+torchrun --nproc_per_node=1 evaluate_with_analysis.py \
+    --ckpt unet_cifar10_meanflow_100k_ema.pt \
+    --per-proc-batch-size 128 \
+    --num-fid-samples 50000 \
+    --sample-dir "./fid_dir" \
+    --compute-metrics \
+    --num-steps 10 \
+    --fid-ref "train" \
+    --analyze-velocity
+
+# Without velocity analysis (faster)
+torchrun --nproc_per_node=1 evaluate_with_analysis.py \
+    --ckpt unet_cifar10_meanflow_100k_ema.pt \
+    --per-proc-batch-size 128 \
+    --num-fid-samples 50000 \
+    --sample-dir "./fid_dir" \
+    --compute-metrics \
+    --num-steps 10 \
+    --fid-ref "train"
+torchrun --nproc_per_node=1 evaluate_with_analysis.py \
+    --ckpt unet_cifar10_meanflow_100k_ema.pt \
+    --per-proc-batch-size 128 \
+    --num-fid-samples 1000 \
+    --sample-dir "./fid_dir/nonuniform_gamma0.5/" \
+    --compute-metrics \
+    --num-steps 100 \
+    --fid-ref "train" \
+    --analyze-velocity \
+    --use-nonuniform \
+    --gamma 0.5
