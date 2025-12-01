@@ -8,7 +8,7 @@ from typing import Mapping, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from models.unet import UNetModel
+from flow_matching.examples.image.models.unet import UNetModel
 
 
 class PixelEmbedding(nn.Module):

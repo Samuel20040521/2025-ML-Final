@@ -5,9 +5,9 @@
 # LICENSE file in the root directory of this source tree.
 from typing import Union
 
-from models.discrete_unet import DiscreteUNetModel
-from models.ema import EMA
-from models.unet import UNetModel
+from flow_matching.examples.image.models.discrete_unet import DiscreteUNetModel
+from flow_matching.examples.image.models.ema import EMA
+from flow_matching.examples.image.models.unet import UNetModel
 
 MODEL_CONFIGS = {
     "imagenet": {

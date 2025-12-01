@@ -1,0 +1,8 @@
+{
+  "fid": 5.197060943072131,
+  "inception_score_mean": 8.64438333326191,
+  "inception_score_std": 0.12569070418305597,
+  "num_samples": 50176,
+  "integration_steps": 100,
+  "checkpoint": "./results/icfm/icfm_cifar10_weights_step_400000.pt"
+}

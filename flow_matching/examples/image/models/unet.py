@@ -16,7 +16,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from models.nn import (
+from flow_matching.examples.image.models.nn import (
     avg_pool_nd,
     checkpoint,
     conv_nd,
