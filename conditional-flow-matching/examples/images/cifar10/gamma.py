@@ -46,16 +46,15 @@ def integrate_model_with_traj(model, x0, timesteps, device):
     vs = torch.stack(vs, dim=1)
     return xs, vs
 
-def run_sampling_and_fid(args, model, device, num_steps, use_uniform=True, rank=0, world_size=1):
+def run_sampling_and_fid(args, model, device, num_steps, gamma, rank=0, world_size=1):
     # Reset seed to ensure same latents across different runs (per rank)
     torch.manual_seed(args.global_seed + rank)
     
-    mode_str = "uniform" if use_uniform else "non-uniform"
     if rank == 0:
-        print(f"\nRunning evaluation for N={num_steps}, mode={mode_str}")
+        print(f"\nRunning evaluation for N={num_steps}, gamma={gamma:.2f}")
     
     # Setup directories
-    sample_dir = os.path.join(args.output_dir, f"samples_N{num_steps}_{mode_str}")
+    sample_dir = os.path.join(args.output_dir, f"samples_N{num_steps}_gamma{gamma:.2f}")
     img_folder = os.path.join(sample_dir, "images")
     
     if rank == 0:
@@ -65,10 +64,7 @@ def run_sampling_and_fid(args, model, device, num_steps, use_uniform=True, rank=
         dist.barrier()
     
     # Determine timesteps
-    if use_uniform:
-        timesteps = torch.linspace(0, 1, num_steps + 1, device=device)
-    else:
-        timesteps = generate_timestep_list(N=num_steps, gamma=0.5, device=device)
+    timesteps = generate_timestep_list(N=num_steps, gamma=gamma, device=device)
     
     # Sampling workload distribution
     total_samples = args.num_fid_samples
@@ -82,7 +78,7 @@ def run_sampling_and_fid(args, model, device, num_steps, use_uniform=True, rank=
     
     iterator = range(iterations)
     if rank == 0:
-        iterator = tqdm(iterator, desc=f"Sampling (N={num_steps}, {mode_str})", unit="batch")
+        iterator = tqdm(iterator, desc=f"Sampling (gamma={gamma:.2f})", unit="batch")
         
     total_generated = 0
     for _ in iterator:
@@ -140,7 +136,7 @@ def run_sampling_and_fid(args, model, device, num_steps, use_uniform=True, rank=
         
         metrics_dict = torch_fidelity.calculate_metrics(**metrics_args)
         fid = metrics_dict.get('frechet_inception_distance', None)
-        print(f"FID ({mode_str}, N={num_steps}): {fid:.2f}")
+        print(f"FID (gamma={gamma:.2f}, N={num_steps}): {fid:.2f}")
         
         # Optional: Cleanup images to save space
         # shutil.rmtree(img_folder)
@@ -162,13 +158,14 @@ def main():
     parser.add_argument("--num_channel", type=int, default=128, help="Base channel of UNet")
     
     # Output
-    parser.add_argument("--output_dir", type=str, default="fid_comparison_results")
+    parser.add_argument("--output_dir", type=str, default="fid_gamma_comparison_results")
     
     # Sampling
     parser.add_argument("--global-seed", type=int, default=42)
     parser.add_argument("--per-proc-batch-size", type=int, default=100)
     parser.add_argument("--num_fid_samples", type=int, default=50000)
     parser.add_argument("--fid_ref", type=str, default="train", choices=["train", "test"])
+    parser.add_argument("--integration_steps", type=int, default=100, help="Number of integration steps (N)")
     
     # DDP
     parser.add_argument("--local_rank", type=int, default=0)
@@ -222,25 +219,18 @@ def main():
     model.load_state_dict(state_dict)
     model.eval()
     
-    # Steps to evaluate
-    N_values = [1] + list(range(10, 101, 10)) # 1, 10, 20, ..., 100
+    # Gammas to evaluate
+    gamma_values = [0.3,0.4 ,0.5, 0.6, 0.7]
     
     results = {
-        "N": N_values,
-        "uniform_fid": [],
-        "non_uniform_fid": []
+        "gamma": gamma_values,
+        "fid": []
     }
     
-    for N in N_values:
-        # Uniform
-        fid_uni = run_sampling_and_fid(args, model, device, N, use_uniform=True, rank=rank, world_size=world_size)
+    for gamma in gamma_values:
+        fid = run_sampling_and_fid(args, model, device, args.integration_steps, gamma, rank=rank, world_size=world_size)
         if rank == 0:
-            results["uniform_fid"].append(fid_uni)
-        
-        # Non-uniform
-        fid_non_uni = run_sampling_and_fid(args, model, device, N, use_uniform=False, rank=rank, world_size=world_size)
-        if rank == 0:
-            results["non_uniform_fid"].append(fid_non_uni)
+            results["fid"].append(fid)
         
         # Save intermediate results (Rank 0 only)
         if rank == 0:
@@ -250,15 +240,14 @@ def main():
     # Plotting (Rank 0 only)
     if rank == 0:
         plt.figure(figsize=(10, 6))
-        plt.plot(results["N"], results["uniform_fid"], 'o-', label='Uniform Timesteps')
-        plt.plot(results["N"], results["non_uniform_fid"], 's-', label='Non-Uniform Timesteps')
-        plt.xlabel('Number of Steps (N)')
+        plt.plot(results["gamma"], results["fid"], 'o-', label=f'N={args.integration_steps}')
+        plt.xlabel('Gamma')
         plt.ylabel('FID')
-        plt.title('FID vs Number of Steps')
+        plt.title(f'FID vs Gamma (N={args.integration_steps})')
         plt.legend()
         plt.grid(True)
-        plt.savefig(os.path.join(args.output_dir, "fid_comparison.png"))
-        print(f"Plot saved to {os.path.join(args.output_dir, 'fid_comparison.png')}")
+        plt.savefig(os.path.join(args.output_dir, "fid_gamma_comparison.png"))
+        print(f"Plot saved to {os.path.join(args.output_dir, 'fid_gamma_comparison.png')}")
     
     if world_size > 1:
         dist.destroy_process_group()

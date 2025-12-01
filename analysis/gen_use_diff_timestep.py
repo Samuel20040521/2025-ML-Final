@@ -139,6 +139,14 @@ def generate_timestep_samples(
     return samples_dict, analysis_dict
 
 
+import json
+
+def save_analysis_json(analysis_dict, output_path):
+    """Save analysis dictionary to JSON file."""
+    with open(output_path, 'w') as f:
+        json.dump(analysis_dict, f, indent=4)
+    print(f"Saved analysis data to {output_path}")
+
 def create_timestep_grid(samples_dict, output_path, max_samples_per_row=8):
     """Create a grid showing samples at different timesteps."""
     timesteps = sorted(samples_dict.keys())
@@ -331,6 +339,10 @@ def main():
     # Plot angular difference analysis
     angular_plot_path = os.path.join(args.output_dir, "angular_difference.png")
     plot_angular_difference(analysis_dict, angular_plot_path)
+    
+    # Save analysis data to JSON
+    json_path = os.path.join(args.output_dir, "nonuniform_analysis.json")
+    save_analysis_json(analysis_dict, json_path)
     
     # Save full grid
     grid_path = os.path.join(args.output_dir, "timestep_grid.png")

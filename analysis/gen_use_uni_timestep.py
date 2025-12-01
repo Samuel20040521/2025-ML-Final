@@ -141,6 +141,14 @@ def generate_timestep_samples(
     return samples_dict, analysis_dict
 
 
+import json
+
+def save_analysis_json(analysis_dict, output_path):
+    """Save analysis dictionary to JSON file."""
+    with open(output_path, 'w') as f:
+        json.dump(analysis_dict, f, indent=4)
+    print(f"Saved analysis data to {output_path}")
+
 def plot_angular_difference(analysis_dict, output_path):
     """Plot angular difference between consecutive velocities."""
     timesteps = analysis_dict['timesteps']
@@ -275,7 +283,7 @@ def main():
     parser = argparse.ArgumentParser("Generate samples using uniform timesteps")
     parser.add_argument("--checkpoint", default="checkpoint-1799.pth", help="Path to checkpoint")
     parser.add_argument("--num_samples", type=int, default=16, help="Number of samples to generate")
-    parser.add_argument("--num_steps", type=int, default=100, help="Number of uniform timesteps (default: 24)")
+    parser.add_argument("--num_steps", type=int, default=40, help="Number of uniform timesteps (default: 24)")
     parser.add_argument("--output_dir", default="./uniform_timestep_samples", help="Output directory")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
@@ -316,6 +324,10 @@ def main():
     # Plot angular difference analysis
     angular_plot_path = os.path.join(args.output_dir, "angular_difference.png")
     plot_angular_difference(analysis_dict, angular_plot_path)
+    
+    # Save analysis data to JSON
+    json_path = os.path.join(args.output_dir, "uniform_analysis.json")
+    save_analysis_json(analysis_dict, json_path)
     
     # Save full grid
     grid_path = os.path.join(args.output_dir, "timestep_grid.png")
