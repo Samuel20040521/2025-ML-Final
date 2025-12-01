@@ -35,7 +35,7 @@ pip install -r requirements.txt
 
 ```
 
-Download the checkpoint [here](https://drive.google.com/drive/folders/1oWt6tdm5WIeVaZnBuUVheKIG3cNDffl9)) with used for cifar10.
+Download the checkpoint [here](https://drive.google.com/drive/folders/1oWt6tdm5WIeVaZnBuUVheKIG3cNDffl9) with used for cifar10.
 
 ```
 python3 evaluate_fid_timesteps.py --ckpt "Your checkpoint place" --output_dir "output_directory" --batch_size "batchsize" --num_fid_samples "numbers of sample for FID computation"
