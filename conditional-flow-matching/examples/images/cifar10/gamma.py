@@ -220,7 +220,7 @@ def main():
     model.eval()
     
     # Gammas to evaluate
-    gamma_values = [0.3,0.4 ,0.5, 0.6, 0.7]
+    gamma_values = [0.6, 0.7]
     
     results = {
         "gamma": gamma_values,

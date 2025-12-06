@@ -272,7 +272,7 @@ def create_timestep_comparison(samples_dict, output_path, sample_idx=0):
     print(f"Saved timestep comparison to {output_path}")
 
 
-def generate_timestep_list(num_steps=24):
+def generate_timestep_list(num_steps=10):
     """Generate uniform timestep list from 0 to 1."""
     # Generate uniform timesteps from 0 to 1
     timesteps = np.linspace(0, 1, num_steps + 1)
@@ -283,7 +283,7 @@ def main():
     parser = argparse.ArgumentParser("Generate samples using uniform timesteps")
     parser.add_argument("--checkpoint", default="checkpoint-1799.pth", help="Path to checkpoint")
     parser.add_argument("--num_samples", type=int, default=16, help="Number of samples to generate")
-    parser.add_argument("--num_steps", type=int, default=40, help="Number of uniform timesteps (default: 24)")
+    parser.add_argument("--num_steps", type=int, default=10, help="Number of uniform timesteps (default: 24)")
     parser.add_argument("--output_dir", default="./uniform_timestep_samples", help="Output directory")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
