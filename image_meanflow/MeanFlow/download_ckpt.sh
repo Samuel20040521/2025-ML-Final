@@ -1,1 +1,1 @@
-gdown -fuzzy https://drive.google.com/file/d/10B7BMQYu0vXZkY2cWa0-kGT84riNPJn6/view?usp=sharing -O sit_b_2_meanflow_ema.pt
+gdown --fuzzy https://drive.google.com/file/d/10B7BMQYu0vXZkY2cWa0-kGT84riNPJn6/view?usp=sharing -O sit_b_2_meanflow_ema.pt

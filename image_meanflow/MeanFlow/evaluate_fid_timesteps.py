@@ -58,7 +58,9 @@ def run_sampling_and_fid(args, model, vae, device, rank, num_steps, use_uniform=
         timesteps = None  # meanflow_sampler defaults to uniform
     else:
         timesteps = generate_timestep_list(N=num_steps, gamma=0.5).to(device)
-    
+        timesteps = timesteps.flip(0)  # Reverse for sampling from t=1 to t=0
+    print(f"Using timesteps: {timesteps}" if timesteps is not None else "Using uniform timesteps.")
+
     # Sampling
     n = args.per_proc_batch_size
     global_batch_size = n * dist.get_world_size()
