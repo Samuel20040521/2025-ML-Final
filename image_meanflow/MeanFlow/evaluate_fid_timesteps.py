@@ -76,6 +76,16 @@ def run_sampling_and_fid(args, model, vae, device, rank, num_steps, use_uniform=
     pbar = tqdm(pbar, desc=f"Sampling ({mode_str})") if rank == 0 else pbar
     total = 0
     
+    # Pre-create tensors to avoid repeated allocation
+    latents_scale = torch.tensor(
+        [0.18125, 0.18125, 0.18125, 0.18125],
+        device=device
+    ).view(1, 4, 1, 1)
+    latents_bias = torch.tensor(
+        [0., 0., 0., 0.],
+        device=device
+    ).view(1, 4, 1, 1)
+    
     for _ in pbar:
         z = torch.randn(n, model.in_channels, latent_size, latent_size, device=device)
         y = torch.randint(0, args.num_classes, (n,), device=device)
@@ -91,19 +101,14 @@ def run_sampling_and_fid(args, model, vae, device, rank, num_steps, use_uniform=
             ).to(torch.float32)
             
             # Decode latents to images
-            latents_scale = torch.tensor(
-                [0.18125, 0.18125, 0.18125, 0.18125]
-            ).view(1, 4, 1, 1).to(device)
-            latents_bias = torch.tensor(
-                [0., 0., 0., 0.]
-            ).view(1, 4, 1, 1).to(device)
             samples = vae.decode((samples - latents_bias) / latents_scale).sample
             samples = (samples + 1) / 2.
             samples = torch.clamp(255. * samples, 0, 255).permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
-            
-            for i, sample in enumerate(samples):
-                index = i * dist.get_world_size() + rank + total
-                Image.fromarray(sample).save(f"{img_folder}/{index:06d}.png")
+        
+        # Save images (done outside torch.no_grad to allow GPU to process next batch)
+        for i, sample in enumerate(samples):
+            index = i * dist.get_world_size() + rank + total
+            Image.fromarray(sample).save(f"{img_folder}/{index:06d}.png")
         
         total += global_batch_size
     
