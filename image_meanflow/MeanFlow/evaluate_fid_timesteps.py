@@ -86,7 +86,11 @@ def run_sampling_and_fid(args, model, vae, device, rank, num_steps, use_uniform=
         device=device
     ).view(1, 4, 1, 1)
     
-    for _ in pbar:
+    # Buffer to accumulate samples before saving
+    sample_buffer = []
+    index_buffer = []
+    
+    for iter_idx in pbar:
         z = torch.randn(n, model.in_channels, latent_size, latent_size, device=device)
         y = torch.randint(0, args.num_classes, (n,), device=device)
         
@@ -105,12 +109,20 @@ def run_sampling_and_fid(args, model, vae, device, rank, num_steps, use_uniform=
             samples = (samples + 1) / 2.
             samples = torch.clamp(255. * samples, 0, 255).permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
         
-        # Save images (done outside torch.no_grad to allow GPU to process next batch)
+        # Accumulate samples in buffer
         for i, sample in enumerate(samples):
             index = i * dist.get_world_size() + rank + total
-            Image.fromarray(sample).save(f"{img_folder}/{index:06d}.png")
+            sample_buffer.append(sample)
+            index_buffer.append(index)
         
         total += global_batch_size
+        
+        # Save when buffer is full or at the last iteration
+        if len(sample_buffer) >= n or iter_idx == iterations - 1:
+            for sample, index in zip(sample_buffer, index_buffer):
+                Image.fromarray(sample).save(f"{img_folder}/{index:06d}.png")
+            sample_buffer.clear()
+            index_buffer.clear()
     
     dist.barrier()
     
