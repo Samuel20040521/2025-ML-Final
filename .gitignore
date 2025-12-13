@@ -1,4 +1,38 @@
 # Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
 *.pth
 *.pt
+
+# Logs
+*.log
+nohup.out
+
+# Results and samples (large files)
+result/
+samples*/
+test_output/
+
+# Model checkpoints
+*.pt:Zone.Identifier
+
+# Python virtual environments
+venv/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# FID cache
+fid_dir/
 *.png
