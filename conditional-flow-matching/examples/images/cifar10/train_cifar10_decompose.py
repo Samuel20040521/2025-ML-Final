@@ -20,7 +20,6 @@ from torchcfm.conditional_flow_matching import (
     TargetConditionalFlowMatcher,
     VariancePreservingConditionalFlowMatcher,
 )
-# [重要] 確保這裡 import 到的是你剛剛修改過包含 BottleneckEnergyHead 的新模型
 from torchcfm.models.unet.unet import UNetModel_Decompose_Wrapper
 
 FLAGS = flags.FLAGS
@@ -47,10 +46,6 @@ flags.DEFINE_integer(
     help="frequency of saving checkpoints, 0 to disable during training",
 )
 
-# === Decomposition Loss Weights (Recommended Strategy) ===
-# lambda_vec: 1.0   -> 總重建 Loss (裁判)，確保最終合成結果正確，並提供對能量強區域的注意力。
-# lambda_energy: 0.1 -> 能量 Loss (營養師)，因為 scalar 很好學，設小一點避免搶走梯度。
-# lambda_shape: 1.0 -> 形狀 Loss (教練)，專門糾正方向和紋理，解決模糊問題。
 flags.DEFINE_float("lambda_vec", 1.0, help="weight for total reconstruction loss")
 flags.DEFINE_float("lambda_energy", 0.1, help="weight for energy (scalar) loss")
 flags.DEFINE_float("lambda_shape", 1.0, help="weight for shape (spatial) loss")
@@ -147,16 +142,15 @@ def decompose_loss_bottleneck(v_pred, energy_pred, shape_pred, u_target):
     """
     
     # 1. Vector-level MSE (The "Referee" Loss)
-    # 確保最終合成結果與目標一致，這隱含了對高能量區域的關注。
     loss_vec = F.mse_loss(v_pred, u_target)
 
     # --- Prepare Ground Truth Decomposition ---
     
-    # Target Energy: 計算 GT 在空間維度 (H, W) 上的總能量
+    # Target Energy
     # [B, C, H, W] -> [B, C]
     target_energy = torch.norm(u_target, p=2, dim=(2, 3))
     
-    # Target Shape: 計算 GT 的空間歸一化形狀
+    # Target Shape
     # 加上 eps 避免全黑背景導致除以零
     eps = 1e-8
     # Broadcast energy: [B, C] -> [B, C, 1, 1]
@@ -165,12 +159,9 @@ def decompose_loss_bottleneck(v_pred, energy_pred, shape_pred, u_target):
     # --- Calculate Component Losses ---
 
     # 2. Energy Loss (Scalar MSE) (The "Volume" Loss)
-    # 比較預測的總能量 vs 真實的總能量
     loss_energy = F.mse_loss(energy_pred, target_energy)
 
     # 3. Shape Loss (Spatial Cosine Similarity) (The "Structure" Loss)
-    # 由於 shape_pred 和 target_shape 都是在 (H, W) 空間上的 Unit Vectors
-    # Dot Product 就等於 Cosine Similarity (不需要再除 norm)
     # Sum over H, W dimensions -> [B, C]
     spatial_cosine = torch.sum(shape_pred * target_shape, dim=(2, 3))
     

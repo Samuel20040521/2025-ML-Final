@@ -83,3 +83,47 @@ We will give the example commands to run our code.
 ```
 python3 analysis_compute_fid_nonuniform.py --ckpt results/icfm/icfm_cifar10_weights_step_400000.py --num_fid_samples 50000
 ```
+
+## Running Angle-Energy Decomposition Architecture Training
+
+To run the Angle-Energy Decomposition Architecture Training, please follow the below commands.
+
+Ensure you are in the `conditional-flow-matching/examples/images/cifar10` directory and have the `torchcfm` environment activated (as described in the Conditional flowmatching section).
+
+```bash
+cd conditional-flow-matching/examples/images/cifar10
+```
+
+Run the training script:
+
+```bash
+python3 train_cifar10_decompose.py --model icfm --output_dir ./results_decompose --lambda_vec 1.0 --lambda_energy 0.1 --lambda_shape 1.0
+```
+
+**Arguments:**
+- `--model`: Flow matching model type (`otcfm`, `icfm`, `fm`, `si`). Default: `otcfm`.
+- `--output_dir`: Directory to save results and checkpoints.
+- `--lambda_vec`: Weight for the total reconstruction loss (vector field MSE).
+- `--lambda_energy`: Weight for the energy (scalar) loss.
+- `--lambda_shape`: Weight for the shape (spatial cosine) loss.
+- `--total_steps`: Total training steps. Default: 400001.
+
+### Conda environment setup
+
+```bash
+# clone project
+cd conditional-flow-matching
+
+# [OPTIONAL] create conda environment
+conda create -n torchcfm python=3.10
+conda activate torchcfm
+
+# install pytorch according to instructions
+# https://pytorch.org/get-started/
+
+# install requirements
+pip install -r requirements.txt
+
+# install torchcfm
+pip install -e .
+
