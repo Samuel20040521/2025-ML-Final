@@ -1,0 +1,21 @@
+{
+    "N": [
+        1,
+        10,
+        20,
+        30,
+        40,
+        50,
+        60,
+        70
+    ],
+    "uniform_fid": [
+        null
+    ],
+    "non_uniform_fid": [
+        null
+    ],
+    "gamma": 0.5,
+    "cfg_scale": 1.0,
+    "num_samples": 100
+}
