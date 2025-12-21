@@ -13,7 +13,7 @@ import torch.distributed as dist
 import torch_fidelity
 from torchdiffeq import odeint
 
-from torchcfm.models.unet.unet import UNetModelWrapper
+from torchcfm.models.unet.unet import UNetModel_Decompose_Wrapper
 
 def generate_timestep_list(N=40, gamma=0.5, device='cpu'):
     k = torch.arange(0, N+1, device=device)
@@ -21,38 +21,64 @@ def generate_timestep_list(N=40, gamma=0.5, device='cpu'):
     t = 0.5 + 0.5 * torch.sign(s - 0.5) * torch.abs(2*s - 1)**gamma
     return t  # shape [N+1]
 
-def integrate_model_with_traj(model, x0, timesteps, device, method='euler'):
+def integrate_model_with_traj(model, x0, timesteps, device, method='dopri5', rtol=1e-5, atol=1e-5):
     """
-    Integration with custom timesteps using torchdiffeq.
-    timesteps: Tensor of shape [T+1]
+    ODE integration with custom timesteps for UNetModel_Decompose.
+    
+    For adaptive methods (dopri5, etc.): uses rtol/atol to control accuracy
+    For fixed-step methods (rk4, euler, etc.): uses all provided timesteps
+    
+    timesteps: Tensor of shape [T+1] - the evaluation points
+    method: Integration method (dopri5, rk4, euler, etc.)
     """
+    # Wrapper to handle model output
     def ode_func(t, x):
         # Expand t for batch
         t_input = t.view(1, 1, 1, 1).expand(x.size(0), 1, 1, 1)
-        return model(t_input, x)
-
+        output = model(t_input, x)
+        # Ensure we only use v, in case model returns tuple
+        if isinstance(output, tuple):
+            return output[0]
+        else:
+            return output
+    
+    # Adaptive methods only need start and end time
+    # Fixed-step methods need all timesteps to respect the schedule
+    adaptive_methods = ['dopri5', 'dopri8', 'bosh3', 'adaptive_heun', 'fehlberg2']
+    
+    if method in adaptive_methods:
+        # For adaptive methods, only use start and end
+        t_eval = torch.tensor([timesteps[0], timesteps[-1]], device=device)
+    else:
+        # For fixed-step methods (rk4, euler, midpoint, etc.), use all timesteps
+        t_eval = timesteps
+    
     # Perform integration
     traj = odeint(
         ode_func,
         x0,
-        timesteps,
+        t_eval,
+        rtol=rtol,
+        atol=atol,
         method=method,
     )
     
-    # traj shape is [T+1, B, C, H, W] -> [B, T+1, C, H, W]
+    # Return trajectory: traj shape is [T, B, C, H, W]
+    # Permute to [B, T, C, H, W]
     xs = traj.permute(1, 0, 2, 3, 4)
-    return xs, None
+    vs = None
+    return xs, vs
 
-def run_sampling_and_fid(args, model, device, num_steps, method='euler', use_uniform=True, rank=0, world_size=1):
+def run_sampling_and_fid(args, model, device, num_steps, use_uniform=True, rank=0, world_size=1):
     # Reset seed to ensure same latents across different runs (per rank)
     torch.manual_seed(args.global_seed + rank)
     
     mode_str = "uniform" if use_uniform else "non-uniform"
     if rank == 0:
-        print(f"\nRunning evaluation for N={num_steps}, method={method}, mode={mode_str}")
+        print(f"\nRunning evaluation for N={num_steps}, mode={mode_str}, method={args.integration_method}")
     
     # Setup directories
-    sample_dir = os.path.join(args.output_dir, f"samples_N{num_steps}_{method}_{mode_str}")
+    sample_dir = os.path.join(args.output_dir, f"samples_N{num_steps}_{mode_str}_{args.integration_method}")
     img_folder = os.path.join(sample_dir, "images")
     
     if rank == 0:
@@ -61,7 +87,7 @@ def run_sampling_and_fid(args, model, device, num_steps, method='euler', use_uni
     if world_size > 1:
         dist.barrier()
     
-    # Determine timesteps
+    # Determine timesteps (Note: for adaptive methods, only start/end matters)
     if use_uniform:
         timesteps = torch.linspace(0, 1, num_steps + 1, device=device)
     else:
@@ -79,7 +105,7 @@ def run_sampling_and_fid(args, model, device, num_steps, method='euler', use_uni
     
     iterator = range(iterations)
     if rank == 0:
-        iterator = tqdm(iterator, desc=f"Sampling (N={num_steps}, {method}, {mode_str})", unit="batch")
+        iterator = tqdm(iterator, desc=f"Sampling (N={num_steps}, {mode_str})", unit="batch")
         
     total_generated = 0
     for _ in iterator:
@@ -95,7 +121,9 @@ def run_sampling_and_fid(args, model, device, num_steps, method='euler', use_uni
                 x0=z,
                 timesteps=timesteps,
                 device=device,
-                method=method
+                method=args.integration_method,
+                rtol=args.rtol,
+                atol=args.atol,
             )
             xT = xs[:, -1]
             
@@ -122,29 +150,17 @@ def run_sampling_and_fid(args, model, device, num_steps, method='euler', use_uni
             import torch.serialization as _ts
             import numpy as _np
             if hasattr(_ts, "add_safe_globals"):
-                safe_globals = [_np.ndarray, _np.dtype]
-                
-                # Add numpy dtypes which are often pickled
-                try:
-                    safe_globals.extend([
-                        _np.dtypes.Float32DType,
-                        _np.dtypes.Float64DType,
-                        _np.dtypes.Int32DType,
-                        _np.dtypes.Int64DType,
-                        _np.dtypes.UInt8DType,
-                    ])
-                except AttributeError:
-                    pass
-
-                # Attempt to add numpy reconstruction function if accessible
-                try:
-                    safe_globals.append(_np._core.multiarray._reconstruct)
-                except AttributeError:
-                    try:
-                        safe_globals.append(_np.core.multiarray._reconstruct)
-                    except AttributeError:
-                        pass
-                _ts.add_safe_globals(safe_globals)
+                # Add all necessary numpy types for FID cache loading
+                _ts.add_safe_globals([
+                    _np.ndarray, 
+                    _np.dtype,
+                    _np._core.multiarray._reconstruct,
+                    _np.dtypes.Float32DType,
+                    _np.dtypes.Float64DType,
+                    _np.dtypes.Int32DType,
+                    _np.dtypes.Int64DType,
+                    _np.dtypes.UInt8DType,
+                ])
         except Exception as e:
             print(f"Warning: Could not add safe globals: {e}")
 
@@ -160,7 +176,7 @@ def run_sampling_and_fid(args, model, device, num_steps, method='euler', use_uni
         
         metrics_dict = torch_fidelity.calculate_metrics(**metrics_args)
         fid = metrics_dict.get('frechet_inception_distance', None)
-        print(f"FID ({mode_str}, {method}, N={num_steps}): {fid:.2f}")
+        print(f"FID ({mode_str}, N={num_steps}): {fid:.2f}")
         
         # Optional: Cleanup images to save space
         # shutil.rmtree(img_folder)
@@ -177,12 +193,18 @@ def main():
     # Model/ckpt
     parser.add_argument("--ckpt", type=str, default="", help="Path to checkpoint (.pt).")
     parser.add_argument("--input-dir", type=str, default="./results", help="Base directory for checkpoints")
-    parser.add_argument("--model", type=str, default="icfm", help="Model name")
+    parser.add_argument("--model", type=str, default="icfm_decompose", help="Model name")
     parser.add_argument("--step", type=int, default=400000, help="Training step")
     parser.add_argument("--num_channel", type=int, default=128, help="Base channel of UNet")
     
     # Output
-    parser.add_argument("--output_dir", type=str, default="fid_comparison_results_nfe")
+    parser.add_argument("--output_dir", type=str, default="fid_comparison_results_decompose")
+    
+    # Integration
+    parser.add_argument("--integration_method", type=str, default="dopri5", 
+                        help="Integration method (dopri5, rk4, euler, etc.)")
+    parser.add_argument("--rtol", type=float, default=1e-5, help="Relative tolerance for adaptive solvers")
+    parser.add_argument("--atol", type=float, default=1e-5, help="Absolute tolerance for adaptive solvers")
     
     # Sampling
     parser.add_argument("--global-seed", type=int, default=42)
@@ -213,8 +235,8 @@ def main():
         print(f"Initialized DDP with world_size={world_size}")
         os.makedirs(args.output_dir, exist_ok=True)
     
-    # Load Model
-    model = UNetModelWrapper(
+    # Load Model - Using UNetModel_Decompose_Wrapper
+    model = UNetModel_Decompose_Wrapper(
         dim=(3, 32, 32),
         num_res_blocks=2,
         num_channels=args.num_channel,
@@ -242,41 +264,25 @@ def main():
     model.load_state_dict(state_dict)
     model.eval()
     
-    # Solvers and NFEs to evaluate
-    solvers = ['euler', 'rk4', 'midpoint']
-    target_nfes = [20, 50, 80]
+    # Steps to evaluate
+    N_values = [20, 50, 70]
     
     results = {
-        "nfe": target_nfes,
-        "data": {} # solver -> { "uniform": [], "non_uniform": [] }
+        "N": N_values,
+        "uniform_fid": [],
+        "non_uniform_fid": []
     }
     
-    for solver in solvers:
-        results["data"][solver] = {"uniform": [], "non_uniform": []}
+    for N in N_values:
+        # Uniform
+        fid_uni = run_sampling_and_fid(args, model, device, N, use_uniform=True, rank=rank, world_size=world_size)
+        if rank == 0:
+            results["uniform_fid"].append(fid_uni)
         
-        # Determine cost per step
-        if solver == 'euler':
-            cost = 1
-        elif solver == 'midpoint':
-            cost = 2
-        elif solver == 'rk4':
-            cost = 4
-        else:
-            cost = 1 # Default/Unknown
-            
-        for nfe in target_nfes:
-            # Calculate steps
-            steps = max(1, nfe // cost)
-            
-            # Uniform
-            fid_uni = run_sampling_and_fid(args, model, device, steps, method=solver, use_uniform=True, rank=rank, world_size=world_size)
-            if rank == 0:
-                results["data"][solver]["uniform"].append(fid_uni)
-            
-            # Non-uniform
-            fid_non_uni = run_sampling_and_fid(args, model, device, steps, method=solver, use_uniform=False, rank=rank, world_size=world_size)
-            if rank == 0:
-                results["data"][solver]["non_uniform"].append(fid_non_uni)
+        # Non-uniform
+        fid_non_uni = run_sampling_and_fid(args, model, device, N, use_uniform=False, rank=rank, world_size=world_size)
+        if rank == 0:
+            results["non_uniform_fid"].append(fid_non_uni)
         
         # Save intermediate results (Rank 0 only)
         if rank == 0:
@@ -285,29 +291,16 @@ def main():
             
     # Plotting (Rank 0 only)
     if rank == 0:
-        plt.figure(figsize=(12, 8))
-        
-        markers = {'euler': 'o', 'rk4': 's', 'midpoint': '^'}
-        colors = {'euler': 'b', 'rk4': 'r', 'midpoint': 'g'}
-        
-        for solver in solvers:
-            # Plot Uniform
-            plt.plot(results["nfe"], results["data"][solver]["uniform"], 
-                     marker=markers.get(solver, 'o'), linestyle='-', color=colors.get(solver, 'k'), 
-                     label=f'{solver} (Uniform)')
-            
-            # Plot Non-Uniform
-            plt.plot(results["nfe"], results["data"][solver]["non_uniform"], 
-                     marker=markers.get(solver, 'o'), linestyle='--', color=colors.get(solver, 'k'), 
-                     label=f'{solver} (Non-Uniform)')
-            
-        plt.xlabel('Number of Function Evaluations (NFE)')
+        plt.figure(figsize=(10, 6))
+        plt.plot(results["N"], results["uniform_fid"], 'o-', label='Uniform Timesteps')
+        plt.plot(results["N"], results["non_uniform_fid"], 's-', label='Non-Uniform Timesteps')
+        plt.xlabel('Number of Steps (N)')
         plt.ylabel('FID')
-        plt.title('FID vs NFE for Different Solvers')
+        plt.title(f'FID vs Number of Steps (UNetModel_Decompose, {args.integration_method})')
         plt.legend()
         plt.grid(True)
-        plt.savefig(os.path.join(args.output_dir, "fid_comparison_nfe.png"))
-        print(f"Plot saved to {os.path.join(args.output_dir, 'fid_comparison_nfe.png')}")
+        plt.savefig(os.path.join(args.output_dir, f"fid_comparison_decompose_{args.integration_method}.png"))
+        print(f"Plot saved to {os.path.join(args.output_dir, f'fid_comparison_decompose_{args.integration_method}.png')}")
     
     if world_size > 1:
         dist.destroy_process_group()
