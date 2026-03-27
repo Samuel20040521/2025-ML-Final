@@ -1,0 +1,8 @@
+{
+    "fid": 3.458629284070753,
+    "inception_score_mean": 9.768684734029971,
+    "inception_score_std": 0.18186950444107455,
+    "num_samples": 50048,
+    "num_steps": 10,
+    "checkpoint": "unet_cifar10_meanflow_100k_ema.pt"
+}

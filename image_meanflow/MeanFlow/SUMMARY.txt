@@ -1,0 +1,182 @@
+╔══════════════════════════════════════════════════════════════════════════════╗
+║         ImageNet256 FID Evaluation with Timestep Schedules - SUMMARY         ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+WHAT WAS CREATED
+================================================================================
+✅ evaluate_fid_timesteps.py      - Main evaluation script (15KB)
+✅ run_fid_evaluation.sh          - Interactive launcher (3.6KB, executable)
+✅ README_FID_EVALUATION.md       - Complete documentation (8.8KB)
+✅ COMPARISON_GUIDE.py            - CIFAR-10 vs ImageNet comparison
+✅ GETTING_STARTED.md             - Quick start guide (7.4KB)
+✅ SUMMARY.txt                    - This summary
+
+QUICK START
+================================================================================
+Option 1 - Interactive:
+  bash run_fid_evaluation.sh
+
+Option 2 - Direct (1 GPU):
+  torchrun --nproc_per_node=1 evaluate_fid_timesteps.py \
+      --ckpt sit_b_2_meanflow_ema.pt \
+      --num-fid-samples 50000 \
+      --cfg-scale 1.5
+
+Option 3 - Multi-GPU (4 GPUs, faster):
+  torchrun --nproc_per_node=4 evaluate_fid_timesteps.py \
+      --ckpt sit_b_2_meanflow_ema.pt \
+      --num-fid-samples 50000
+
+Option 4 - Quick Test (5K samples, fast):
+  torchrun --nproc_per_node=1 evaluate_fid_timesteps.py \
+      --ckpt sit_b_2_meanflow_ema.pt \
+      --num-fid-samples 5000 \
+      --n-values "1,25,50,100" \
+      --cleanup-images
+
+WHAT IT DOES
+================================================================================
+✓ Generates 50,000 ImageNet 256×256 samples (default)
+✓ Tests N ∈ {1, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100} timesteps
+✓ Compares UNIFORM vs NON-UNIFORM timestep schedules
+✓ Computes FID against ImageNet validation set statistics
+✓ Supports multi-GPU distributed sampling (DDP)
+✓ Uses classifier-free guidance (CFG)
+✓ Generates comparison plots automatically
+
+OUTPUT FILES
+================================================================================
+fid_timestep_evaluation/
+  ├── results.json              ← FID scores for all N values
+  ├── fid_comparison.png        ← Plot comparing uniform vs non-uniform
+  └── meanflow-steps-{N}-{mode}-cfg-{cfg}-seed-{seed}/
+      ├── images/               ← 50K generated images (12GB per N)
+      └── metrics.json          ← Detailed metrics
+
+PREREQUISITES
+================================================================================
+1. Download FID statistics:
+   mkdir -p fid_stats
+   wget https://openaipublic.blob.core.windows.net/diffusion/jul-2021/\
+ref_batches/imagenet/256/VIRTUAL_imagenet256_labeled.npz \
+       -O fid_stats/adm_in256_stats.npz
+
+2. Check checkpoint exists:
+   ls -lh sit_b_2_meanflow_ema.pt
+
+3. Install dependencies:
+   pip install torch torchvision diffusers torch-fidelity matplotlib
+
+PERFORMANCE ESTIMATES
+================================================================================
+Configuration        Time/N      Total (11 N)    GPU Memory    Disk Space
+--------------------------------------------------------------------------------
+1 GPU (A100)        15-20 min    3-4 hours       ~10 GB        ~150 GB
+4 GPUs (A100)       4-5 min      45-60 min       ~10 GB each   ~150 GB
+With --cleanup      Same         Same            Same          ~5 GB
+
+KEY ARGUMENTS
+================================================================================
+--ckpt                      Path to checkpoint (REQUIRED)
+--num-fid-samples 50000     Total samples to generate
+--per-proc-batch-size 16    Batch size per GPU (reduce if OOM)
+--cfg-scale 1.5             Classifier-free guidance scale
+--n-values "1,10,20,..."    Which timestep counts to test
+--gamma 0.5                 Non-uniform schedule parameter
+--cleanup-images            Delete images after FID (saves disk)
+--fid-statistics-file       Path to reference statistics
+
+COMPARISON WITH CIFAR-10
+================================================================================
+Feature              CIFAR-10              ImageNet256
+--------------------------------------------------------------------------------
+Script Location      /MeanFlow/            /image_meanflow/MeanFlow/
+Image Size           32×32                 256×256
+Model Type           UNet (pixel)          SiT (VAE latent)
+DDP Required         No                    Yes
+CFG Support          No                    Yes
+Classes              10                    1000
+GPU Memory           ~3 GB                 ~10 GB
+Time per N (1 GPU)   2-3 min               15-20 min
+
+TROUBLESHOOTING
+================================================================================
+Problem: CUDA Out of Memory
+Solution: --per-proc-batch-size 8  (or 4)
+
+Problem: DDP initialization fails
+Solution: export MASTER_ADDR=localhost
+          export MASTER_PORT=29500
+
+Problem: Missing FID statistics
+Solution: Download from link above (see PREREQUISITES)
+
+Problem: Disk space full
+Solution: --cleanup-images flag
+
+Problem: Too slow
+Solution: Use more GPUs or reduce --num-fid-samples for testing
+
+EXAMPLE WORKFLOWS
+================================================================================
+1. Quick Test (verify everything works):
+   torchrun --nproc_per_node=1 evaluate_fid_timesteps.py \
+       --ckpt sit_b_2_meanflow_ema.pt \
+       --num-fid-samples 5000 \
+       --n-values "1,25,50,100" \
+       --cleanup-images
+   
+   ⏱ Time: ~30-45 minutes
+
+2. Full Evaluation (publication-quality):
+   torchrun --nproc_per_node=4 evaluate_fid_timesteps.py \
+       --ckpt sit_b_2_meanflow_ema.pt \
+       --num-fid-samples 50000 \
+       --cfg-scale 1.5
+   
+   ⏱ Time: ~45-60 minutes with 4 GPUs
+
+3. Test Different CFG Scales:
+   for cfg in 1.0 1.5 2.0 2.5; do
+       torchrun --nproc_per_node=4 evaluate_fid_timesteps.py \
+           --ckpt sit_b_2_meanflow_ema.pt \
+           --cfg-scale $cfg \
+           --output-dir fid_cfg_${cfg}
+   done
+
+4. Test Different Gamma Values:
+   for gamma in 0.3 0.5 0.7 1.0; do
+       torchrun --nproc_per_node=4 evaluate_fid_timesteps.py \
+           --ckpt sit_b_2_meanflow_ema.pt \
+           --gamma $gamma \
+           --output-dir fid_gamma_${gamma}
+   done
+
+DOCUMENTATION
+================================================================================
+For detailed information:
+  - Getting Started:     GETTING_STARTED.md
+  - Full Documentation:  README_FID_EVALUATION.md
+  - Comparison Guide:    python COMPARISON_GUIDE.py
+  - Help:                python evaluate_fid_timesteps.py --help
+
+NEXT STEPS
+================================================================================
+1. ✓ Scripts are ready
+2. ☐ Download FID statistics (if needed)
+3. ☐ Verify checkpoint exists
+4. ☐ Run quick test (5K samples)
+5. ☐ Run full evaluation (50K samples)
+6. ☐ Analyze results
+
+Ready to run? Try the quick test:
+  cd /home/dereklin1205/University/ML/2025-ML-Final/image_meanflow/MeanFlow
+  torchrun --nproc_per_node=1 evaluate_fid_timesteps.py \
+      --ckpt sit_b_2_meanflow_ema.pt \
+      --num-fid-samples 5000 \
+      --n-values "1,25,50,100" \
+      --cleanup-images
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                           END OF SUMMARY                                     ║
+╚══════════════════════════════════════════════════════════════════════════════╝
